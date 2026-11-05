@@ -10,6 +10,7 @@ const apiBase = import.meta.env.VITE_API_BASE || 'http://localhost:3010/api';
 const adminKey = ref(localStorage.getItem('templateAdminKey') || '');
 const templates = ref<Template[]>([]);
 const activeType = ref<'COMIC_DRAMA' | 'SHORT_VIDEO' | 'IMAGE_GENERATION'>('COMIC_DRAMA');
+const isCreating = ref(false);
 const models = ref<Model[]>([]);
 const selectedId = ref('');
 const draft = ref<Template | null>(null);
@@ -21,6 +22,7 @@ const uploading = ref(false);
 const currentEpisode = computed(() => draft.value?.episodes[activeEpisode.value]);
 const selectedModel = computed(() => models.value.find((model) => model.code === currentEpisode.value?.modelCode));
 const visibleTemplates = computed(() => templates.value.filter((template) => template.type === activeType.value));
+const isComicDrama = computed(() => draft.value?.type === 'COMIC_DRAMA' || draft.value?.type === 'MV');
 function defaultParamValue(param: ModelParam): unknown {
   const value = param.defaultValue ?? param.options.find((option) => option.isDefault)?.value;
   if (param.type === 'BOOLEAN') return value === 'true';
@@ -86,6 +88,7 @@ function selectTemplateById(id: string) {
   activeEpisode.value = 0;
 }
 function openTemplate(template: Template) {
+  isCreating.value = false;
   selectedId.value = template.id;
   draft.value = structuredClone(toRaw(template));
   normalizeEpisodeModels();
@@ -120,17 +123,22 @@ function emptyEpisode(number: number): Episode {
 function createTemplate() {
   if (!models.value.length) { error.value = '数据库中没有可选模型'; return; }
   const id = `new-${Date.now()}`;
-  const model = models.value[0];
-  const episode = emptyEpisode(1);
-  draft.value = { id, slug: '', title: '', type: activeType.value, category: '', genreId: null, description: '', storyBackground: {}, coverUrl: '', tags: [], audience: null, marketScore: 0, sourceMeta: null, status: 'DRAFT', premium: false, active: true, sortOrder: 0, publishedAt: null, episodes: [episode] };
+  draft.value = { id, slug: '', title: '', type: 'COMIC_DRAMA', category: '', genreId: null, description: '', storyBackground: {}, coverUrl: '', tags: [], audience: null, marketScore: 0, sourceMeta: null, status: 'DRAFT', premium: false, active: true, sortOrder: 0, publishedAt: null, episodes: [emptyEpisode(1)] };
   selectedId.value = id;
+  isCreating.value = true;
   activeEpisode.value = 0;
-  if (model) episode.modelCode = model.code;
 }
 function selectType(type: 'COMIC_DRAMA' | 'SHORT_VIDEO' | 'IMAGE_GENERATION') {
   activeType.value = type;
   draft.value = null;
   selectedId.value = '';
+  isCreating.value = false;
+}
+function selectCreateType(type: 'COMIC_DRAMA' | 'SHORT_VIDEO' | 'IMAGE_GENERATION') {
+  if (!draft.value || !isCreating.value) return;
+  draft.value.type = type;
+  draft.value.episodes = type === 'COMIC_DRAMA' ? [emptyEpisode(1)] : [];
+  activeEpisode.value = 0;
 }
 function changeModel(code: string) {
   const episode = currentEpisode.value;
@@ -157,19 +165,27 @@ async function save() {
     const sanitized = structuredClone(toRaw(draft.value));
     sanitized.episodes = sanitized.episodes.map((episode: Episode) => ({ ...episode, durationSeconds: null, minDurationSeconds: 10, maxDurationSeconds: 30, parameters: Object.fromEntries(Object.entries(episode.parameters || {}).filter(([key]) => key !== 'duration')) }));
     const { id, episodes, ...fields } = sanitized;
-    const payload = { ...fields, publishedAt: fields.publishedAt ? new Date(fields.publishedAt).toISOString() : null, episodes };
-    const result = id.startsWith('new-')
+    const isNewTemplate = id.startsWith('new-');
+    const payload = {
+      ...fields,
+      publishedAt: isNewTemplate
+        ? new Date().toISOString()
+        : fields.publishedAt ? new Date(fields.publishedAt).toISOString() : null,
+      episodes,
+    };
+    const result = isNewTemplate
       ? await request('/templates', { method: 'POST', body: JSON.stringify(payload) })
       : await request(`/templates/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) });
     await load();
     if (result?.template?.id) selectTemplateById(result.template.id);
+    isCreating.value = false;
     notice.value = '模板已保存';
   } catch (e) { error.value = e instanceof Error ? e.message : '保存失败'; }
   finally { loading.value = false; }
 }
 async function removeTemplate() {
   if (!draft.value || draft.value.id.startsWith('new-')) { draft.value = null; selectedId.value = ''; return; }
-  if (!window.confirm(`确定删除「${draft.value.title}」及其全部剧集吗？`)) return;
+  if (!window.confirm(`确定删除「${draft.value.title}」吗？`)) return;
   loading.value = true; error.value = '';
   try { await request(`/templates/${encodeURIComponent(draft.value.id)}`, { method: 'DELETE' }); draft.value = null; selectedId.value = ''; await load(); notice.value = '模板已删除'; }
   catch (e) { error.value = e instanceof Error ? e.message : '删除失败'; }
@@ -201,20 +217,21 @@ onMounted(() => { void load(); });
           <div v-if="!visibleTemplates.length" class="empty-list">{{ loading ? '正在加载…' : '暂无模板' }}</div>
           <button v-for="item in visibleTemplates" :key="item.id" type="button" class="template-row" :class="{ selected: selectedId === item.id }" @click="openTemplate(item)">
             <img :src="item.coverUrl || 'https://images.unsplash.com/photo-1519608487953-e999c86e7455?w=300'" alt="" />
-            <span class="row-copy"><strong>{{ item.title }}</strong><small>{{ item.category || '未分类' }} · {{ item.episodes.length }} 集</small></span>
+            <span class="row-copy"><strong>{{ item.title }}</strong><small>{{ item.category || '未分类' }}<template v-if="item.type === 'COMIC_DRAMA' || item.type === 'MV'"> · {{ item.episodes.length }} 集</template></small></span>
             <span class="status-dot" :class="item.status.toLowerCase()" :title="item.status"></span>
           </button>
         </aside>
         <section v-if="draft" class="editor">
           <div class="editor-head"><div><div class="breadcrumbs">模板库 <span>/</span> {{ draft.id.startsWith('new-') ? '新建模板' : draft.slug }}</div><h2>{{ draft.title || '未命名模板' }}</h2></div><div class="editor-actions"><button class="danger-quiet" @click="removeTemplate">删除</button><button class="primary" :disabled="loading" @click="save">{{ loading ? '保存中…' : '保存更改' }}</button></div></div>
-          <div class="tabbar"><button class="tab active">模板信息</button><span class="divider"></span><button class="tab active">剧集配置</button><span class="spacer"></span><span class="saved-label">{{ draft.status }}</span></div>
+          <div v-if="isCreating" class="create-type-tabs" role="tablist" aria-label="选择新建模板类型"><button :class="{ active: draft.type === 'COMIC_DRAMA' }" @click="selectCreateType('COMIC_DRAMA')">漫剧模板</button><button :class="{ active: draft.type === 'SHORT_VIDEO' }" @click="selectCreateType('SHORT_VIDEO')">视频模板</button><button :class="{ active: draft.type === 'IMAGE_GENERATION' }" @click="selectCreateType('IMAGE_GENERATION')">图片模板</button></div>
+          <div class="tabbar"><button class="tab active">{{ draft.type === 'COMIC_DRAMA' ? '漫剧模板信息' : draft.type === 'SHORT_VIDEO' ? '视频模板信息' : '图片模板信息' }}</button><template v-if="isComicDrama"><span class="divider"></span><button class="tab active">剧集配置</button></template><span class="spacer"></span><span class="saved-label">{{ draft.status }}</span></div>
           <div class="editor-content">
             <section class="form-section"><div class="section-title"><div><h3>基本信息</h3><p>模板在客户端展示的名称、分类和封面</p></div></div>
-              <div class="form-grid"><label>模板名称<input v-model="draft.title" maxlength="200" placeholder="输入模板名称" /></label><label>唯一标识<input v-model="draft.slug" maxlength="160" placeholder="例如: neon-dream" /></label><label>类型><input :value="draft.type === 'COMIC_DRAMA' ? '漫剧' : draft.type === 'SHORT_VIDEO' ? '视频' : '图片'" readonly /></label><label>分类<input v-model="draft.category" placeholder="例如：科幻 / 爱情" /></label><label class="span-2 asset-field">封面图<div class="asset-drop" @dragover.prevent @drop="handleDrop($event, (url) => draft!.coverUrl = url)" @click="chooseFile((url) => draft!.coverUrl = url)"><img v-if="draft.coverUrl" :src="draft.coverUrl" alt="封面预览" /><span v-else>拖拽图片到这里，或点击上传</span></div><input :value="draft.coverUrl" readonly placeholder="上传完成后显示阿里云链接" /></label><label class="span-2">描述<textarea v-model="draft.description" rows="3" placeholder="模板简介"></textarea></label><label>状态<select v-model="draft.status"><option value="DRAFT">草稿</option><option value="PUBLISHED">已发布</option><option value="ARCHIVED">已归档</option></select></label><label>标签<input :value="draft.tags.join(', ')" placeholder="逗号分隔" @input="draft.tags = ($event.target as HTMLInputElement).value.split(',').map((tag) => tag.trim()).filter(Boolean)" /></label><label>目标受众<input v-model="draft.audience" placeholder="可选" /></label><label>市场评分<input v-model.number="draft.marketScore" type="number" min="0" max="100" step="0.01" /></label></div>
+              <div class="form-grid"><label>模板名称<input v-model="draft.title" maxlength="200" placeholder="输入模板名称" /></label><label>唯一标识<input v-model="draft.slug" maxlength="160" placeholder="例如: neon-dream" /></label><label>类型><input :value="draft.type === 'COMIC_DRAMA' ? '漫剧' : draft.type === 'SHORT_VIDEO' ? '视频' : '图片'" readonly /></label><label>分类<input v-model="draft.category" placeholder="例如：科幻 / 爱情" /></label><label class="span-2 asset-field">封面图<div class="asset-drop" @dragover.prevent @drop="handleDrop($event, (url) => draft!.coverUrl = url)" @click="chooseFile((url) => draft!.coverUrl = url)"><img v-if="draft.coverUrl" :src="draft.coverUrl" alt="封面预览" /><span v-else>拖拽图片到这里，或点击上传</span></div><input :value="draft.coverUrl" readonly placeholder="上传完成后显示阿里云链接" /></label><label class="span-2">{{ isComicDrama ? '描述' : '生成提示词' }}<textarea v-model="draft.description" rows="4" :placeholder="isComicDrama ? '模板简介' : '描述希望生成的画面、风格与内容'" /></label><label>状态<select v-model="draft.status"><option value="DRAFT">草稿</option><option value="PUBLISHED">已发布</option><option value="ARCHIVED">已归档</option></select></label><label>标签<input :value="draft.tags.join(', ')" placeholder="逗号分隔" @input="draft.tags = ($event.target as HTMLInputElement).value.split(',').map((tag) => tag.trim()).filter(Boolean)" /></label><label v-if="isComicDrama">目标受众<input v-model="draft.audience" placeholder="可选" /></label><label v-if="isComicDrama">市场评分<input v-model.number="draft.marketScore" type="number" min="0" max="100" step="0.01" /></label></div>
               <div class="switch-row"><label><input v-model="draft.active" type="checkbox" /> 启用模板</label><label><input v-model="draft.premium" type="checkbox" /> 付费模板</label><label>排序权重 <input v-model.number="draft.sortOrder" type="number" class="short-input" /></label></div>
-              <details class="advanced-fields"><summary>故事背景与来源数据</summary><div class="form-grid"><label>故事背景 JSON<textarea :value="JSON.stringify(draft.storyBackground, null, 2)" rows="5" @change="parseJsonField($event, (value) => { draft!.storyBackground = value; })"></textarea></label><label>来源元数据 JSON<textarea :value="JSON.stringify(draft.sourceMeta, null, 2)" rows="5" @change="parseJsonField($event, (value) => { draft!.sourceMeta = value; })"></textarea></label><label>题材 ID<input v-model="draft.genreId" placeholder="数据库 Genre ID，可留空" /></label><label>发布时间<input v-model="draft.publishedAt" type="datetime-local" /></label></div></details>
+              <details v-if="isComicDrama" class="advanced-fields"><summary>故事背景与来源数据</summary><div class="form-grid"><label>故事背景 JSON<textarea :value="JSON.stringify(draft.storyBackground, null, 2)" rows="5" @change="parseJsonField($event, (value) => { draft!.storyBackground = value; })"></textarea></label><label>来源元数据 JSON<textarea :value="JSON.stringify(draft.sourceMeta, null, 2)" rows="5" @change="parseJsonField($event, (value) => { draft!.sourceMeta = value; })"></textarea></label><label>题材 ID<input v-model="draft.genreId" placeholder="数据库 Genre ID，可留空" /></label></div></details>
             </section>
-            <section class="form-section episode-section"><div class="section-title"><div><h3>剧集与生成参数</h3><p>为每集选择模型并设置模型所需参数</p></div><button class="secondary" @click="addEpisode">＋ 添加剧集</button></div>
+            <section v-if="isComicDrama" class="form-section episode-section"><div class="section-title"><div><h3>剧集与生成参数</h3><p>为每集选择模型并设置模型所需参数</p></div><button class="secondary" @click="addEpisode">＋ 添加剧集</button></div>
               <div class="episode-tabs"><button v-for="(episode, index) in draft.episodes" :key="index" :class="{ active: activeEpisode === index }" @click="activeEpisode = index">EP {{ String(index + 1).padStart(2, '0') }}</button><button class="add-tab" title="移除当前剧集" @click="removeEpisode">−</button></div>
               <template v-if="currentEpisode">
                 <div class="form-grid episode-grid"><label>剧集序号<input v-model.number="currentEpisode.number" type="number" min="1" max="1000000" /></label><label>剧集标题<input v-model="currentEpisode.title" placeholder="剧集名称" /></label><label>简介<input v-model="currentEpisode.synopsis" placeholder="本集概要" /></label><label>使用模型<select :value="currentEpisode.modelCode" @change="changeModel(($event.target as HTMLSelectElement).value)"><option disabled value="">选择数据库模型</option><option v-for="model in models" :key="model.id" :value="model.code">{{ model.name }} · {{ model.modality }}</option></select></label><span></span><label class="span-2">正向提示词<textarea v-model="currentEpisode.promptTemplate" rows="4" placeholder="输入模板提示词"></textarea></label><label class="span-2">负向提示词<textarea v-model="currentEpisode.negativePrompt" rows="2" placeholder="不希望生成的内容"></textarea></label></div>
