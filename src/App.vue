@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, toRaw } from 'vue';
+import * as XLSX from 'xlsx';
+import { unzipSync } from 'fflate';
 
 type ModelOption = { value: string; label: string; isDefault: boolean; thumbnail?: string | null };
 type ModelParam = { key: string; label: string; description?: string | null; type: string; required: boolean; defaultValue?: string | null; min?: number | null; max?: number | null; unit?: string | null; options: ModelOption[] };
@@ -19,10 +21,13 @@ const loading = ref(false);
 const notice = ref('');
 const error = ref('');
 const uploading = ref(false);
+const importing = ref(false);
+const importInput = ref<HTMLInputElement | null>(null);
 const currentEpisode = computed(() => draft.value?.episodes[activeEpisode.value]);
 const selectedModel = computed(() => models.value.find((model) => model.code === currentEpisode.value?.modelCode));
 const visibleTemplates = computed(() => templates.value.filter((template) => template.type === activeType.value));
 const isComicDrama = computed(() => draft.value?.type === 'COMIC_DRAMA' || draft.value?.type === 'MV');
+const typeLabel = computed(() => activeType.value === 'COMIC_DRAMA' ? '漫剧' : activeType.value === 'SHORT_VIDEO' ? '视频' : '图片');
 function defaultParamValue(param: ModelParam): unknown {
   const value = param.defaultValue ?? param.options.find((option) => option.isDefault)?.value;
   if (param.type === 'BOOLEAN') return value === 'true';
@@ -52,6 +57,138 @@ async function uploadAsset(file: File, assign: (url: string) => void) {
     notice.value = '素材上传完成';
   } catch (e) { error.value = e instanceof Error ? e.message : '素材上传失败'; }
   finally { uploading.value = false; }
+}
+async function uploadAssetFile(file: File): Promise<string> {
+  if (!file.type.startsWith('image/')) throw new Error(`封面必须是图片文件：${file.name}`);
+  const response = await fetch(`${apiBase}/templates/assets`, { method: 'POST', body: file, headers: { 'Content-Type': file.type, 'x-template-admin-key': adminKey.value } });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(payload?.error?.message || `封面上传失败 (${response.status})`);
+  return payload.url as string;
+}
+function workbookTemplate() {
+  const common = [
+    ['模板名称（必填）', 'title'], ['唯一标识（必填）', 'slug'], ['分类（必填）', 'category'],
+    [activeType.value === 'COMIC_DRAMA' ? '描述（必填）' : '生成提示词（必填）', 'description'],
+    ['封面图链接或图片（必填）', 'coverUrl'], ['标签（逗号分隔）', 'tags'],
+    ['状态（DRAFT/PUBLISHED/ARCHIVED）', 'status'], ['启用（是/否）', 'active'], ['付费（是/否）', 'premium'], ['排序权重', 'sortOrder'],
+  ];
+  const comic = [['目标受众', 'audience'], ['市场评分', 'marketScore'], ['故事背景 JSON', 'storyBackground'], ['剧集序号（必填）', 'episodeNumber'], ['剧集标题（必填）', 'episodeTitle'], ['剧集简介', 'episodeSynopsis'], ['模型编码（必填）', 'modelCode'], ['正向提示词（必填）', 'promptTemplate'], ['负向提示词', 'negativePrompt']];
+  const columns = activeType.value === 'COMIC_DRAMA' ? [...common, ...comic] : common;
+  const headers = columns.map(([label]) => label);
+  const sample: Record<string, unknown> = { title: '示例模板', slug: `example-${activeType.value.toLowerCase()}`, category: '示例分类', description: '在此填写模板描述或生成提示词', coverUrl: 'https://example.com/cover.jpg', tags: '示例,标签', status: 'DRAFT', active: '是', premium: '否', sortOrder: 0 };
+  if (activeType.value === 'COMIC_DRAMA') Object.assign(sample, { audience: '', marketScore: 0, storyBackground: '{}', episodeNumber: 1, episodeTitle: '第 1 集', episodeSynopsis: '', modelCode: models.value[0]?.code || '从模型列表选择编码', promptTemplate: '在此填写剧集正向提示词', negativePrompt: '' });
+  return { columns, headers, sample: columns.map(([, key]) => sample[key as string] ?? '') };
+}
+function downloadExcelTemplate() {
+  const template = workbookTemplate();
+  const sheet = XLSX.utils.aoa_to_sheet([template.headers, template.sample]);
+  sheet['!rows'] = [{ hpt: 32 }, { hpt: 28 }];
+  template.headers.forEach((header, index) => {
+    const cell = XLSX.utils.encode_cell({ r: 0, c: index });
+    sheet[cell].s = { font: { bold: true, color: { rgb: header.includes('（必填）') ? 'C0392B' : '26332B' } }, fill: { fgColor: { rgb: header.includes('（必填）') ? 'FCE9E6' : 'EEF3E7' } }, alignment: { wrapText: true, vertical: 'center' } };
+  });
+  sheet['!cols'] = template.headers.map(() => ({ wch: 26 }));
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, sheet, typeLabel.value);
+  XLSX.writeFile(workbook, `Vilo-${typeLabel.value}-模板导入表.xlsx`);
+}
+type EmbeddedImage = { row: number; file: File };
+function extractEmbeddedImages(buffer: ArrayBuffer): EmbeddedImage[] {
+  const files = unzipSync(new Uint8Array(buffer));
+  const workbookXml = new TextDecoder().decode(files['xl/workbook.xml'] || new Uint8Array());
+  const relsXml = new TextDecoder().decode(files['xl/_rels/workbook.xml.rels'] || new Uint8Array());
+  const sheetId = workbookXml.match(/<sheet\b[^>]*r:id="([^"]+)"/i)?.[1];
+  const relationshipTarget = (xml: string, id: string) => {
+    for (const relationship of xml.matchAll(/<Relationship\b[^>]*\/?\s*>/gi)) {
+      if (relationship[0].match(/\bId="([^"]+)"/i)?.[1] === id) return relationship[0].match(/\bTarget="([^"]+)"/i)?.[1] || null;
+    }
+    return null;
+  };
+  const sheetTarget = sheetId ? relationshipTarget(relsXml, sheetId) : null;
+  if (!sheetTarget) return [];
+  const normalizePath = (base: string, target: string) => {
+    const parts = (target.startsWith('/') ? target.slice(1) : `${base}/${target}`).split('/');
+    const normalized: string[] = [];
+    for (const part of parts) { if (!part || part === '.') continue; if (part === '..') normalized.pop(); else normalized.push(part); }
+    return normalized.join('/');
+  };
+  const sheetPath = normalizePath('', sheetTarget.startsWith('/') ? sheetTarget : `xl/${sheetTarget}`);
+  const sheetXml = new TextDecoder().decode(files[sheetPath] || new Uint8Array());
+  const drawingRelId = sheetXml.match(/<drawing\b[^>]*r:id="([^"]+)"/i)?.[1];
+  const sheetRelPath = sheetPath.replace(/([^/]+)$/, '_rels/$1.rels');
+  const sheetRels = new TextDecoder().decode(files[sheetRelPath] || new Uint8Array());
+  const drawingTarget = drawingRelId ? relationshipTarget(sheetRels, drawingRelId) : null;
+  if (!drawingTarget) return [];
+  const drawingPath = normalizePath(sheetPath.slice(0, sheetPath.lastIndexOf('/')), drawingTarget);
+  const drawingXml = new TextDecoder().decode(files[drawingPath] || new Uint8Array());
+  const drawingRelPath = drawingPath.replace(/([^/]+)$/, '_rels/$1.rels');
+  const drawingRels = new TextDecoder().decode(files[drawingRelPath] || new Uint8Array());
+  const images: EmbeddedImage[] = [];
+  for (const anchor of drawingXml.matchAll(/<(?:xdr:)?(?:oneCellAnchor|twoCellAnchor)\b[\s\S]*?<\/(?:xdr:)?(?:oneCellAnchor|twoCellAnchor)>/gi)) {
+    const row = Number(anchor[0].match(/<(?:xdr:)?from>[\s\S]*?<(?:xdr:)?row>(\d+)<\/(?:xdr:)?row>/i)?.[1]);
+    const relId = anchor[0].match(/<(?:a:)?blip\b[^>]*(?:r:embed|embed)="([^"]+)"/i)?.[1];
+    const target = relId ? relationshipTarget(drawingRels, relId) : null;
+    if (!Number.isFinite(row) || !target) continue;
+    const path = normalizePath(drawingPath.slice(0, drawingPath.lastIndexOf('/')), target);
+    const bytes = files[path];
+    if (!bytes) continue;
+    const ext = path.split('.').pop()?.toLowerCase() || 'png';
+    const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'gif' ? 'image/gif' : ext === 'webp' ? 'image/webp' : 'image/png';
+    images.push({ row: row + 1, file: new File([bytes], `excel-cover-${row + 1}.${ext}`, { type: mime }) });
+  }
+  return images;
+}
+function nonEmpty(value: unknown): string { return value === undefined || value === null ? '' : String(value).trim(); }
+async function importExcel(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file) return;
+  importing.value = true; loading.value = true; error.value = ''; notice.value = '';
+  try {
+    const buffer = await file.arrayBuffer();
+    const workbook = XLSX.read(buffer, { type: 'array', cellDates: false });
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    if (!sheet) throw new Error('Excel 中没有可读取的工作表');
+    const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '', raw: false });
+    if (!rows.length) throw new Error('Excel 中没有数据行');
+    const columnTemplate = workbookTemplate();
+    const headerToKey = new Map(columnTemplate.headers.map((label, index) => [label, columnTemplate.columns[index][1] as string]));
+    const mapped = rows.map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [headerToKey.get(key.trim()) || key.trim().replace(/（必填）/g, ''), value])));
+    const embedded = extractEmbeddedImages(buffer);
+    let created = 0;
+    const failures: string[] = [];
+    for (let index = 0; index < mapped.length; index++) {
+      const row = mapped[index];
+      const excelRow = index + 2;
+      try {
+        let coverUrl = nonEmpty(row.coverUrl);
+        const image = embedded.find((item) => item.row === excelRow);
+        if (!coverUrl && image) coverUrl = await uploadAssetFile(image.file);
+        if (!coverUrl) throw new Error('封面图链接或图片必填');
+        const title = nonEmpty(row.title), slug = nonEmpty(row.slug), category = nonEmpty(row.category), description = nonEmpty(row.description);
+        if (!title || !slug || !category || !description) throw new Error('模板名称、唯一标识、分类、描述/生成提示词均必填');
+        const tags = nonEmpty(row.tags).split(/[,，]/).map((tag) => tag.trim()).filter(Boolean);
+        const booleanValue = (value: unknown, fallback: boolean) => value === '' || value === undefined ? fallback : ['是', 'true', '1', 'yes', 'y'].includes(nonEmpty(value).toLowerCase());
+        const episodes: Episode[] = [];
+        if (activeType.value === 'COMIC_DRAMA') {
+          const episodeNumber = Number(row.episodeNumber), episodeTitle = nonEmpty(row.episodeTitle);
+          const modelCode = nonEmpty(row.modelCode), promptTemplate = nonEmpty(row.promptTemplate);
+          if (!Number.isInteger(episodeNumber) || episodeNumber < 1 || !episodeTitle || !modelCode || !promptTemplate || !models.value.some((model) => model.code === modelCode)) throw new Error('剧集序号、剧集标题、可选模型编码和正向提示词均必填');
+          episodes.push({ ...emptyEpisode(episodeNumber), number: episodeNumber, title: episodeTitle, synopsis: nonEmpty(row.episodeSynopsis), modelCode, promptTemplate, negativePrompt: nonEmpty(row.negativePrompt), parameters: {} });
+        }
+        const payload = { slug, title, type: activeType.value, category, genreId: null, description, storyBackground: activeType.value === 'COMIC_DRAMA' && nonEmpty(row.storyBackground) ? JSON.parse(nonEmpty(row.storyBackground)) : {}, coverUrl, tags, audience: nonEmpty(row.audience) || null, marketScore: Number(row.marketScore) || 0, sourceMeta: null, status: ['PUBLISHED', 'ARCHIVED'].includes(nonEmpty(row.status).toUpperCase()) ? nonEmpty(row.status).toUpperCase() : 'DRAFT', premium: booleanValue(row.premium, false), active: booleanValue(row.active, true), sortOrder: Number(row.sortOrder) || 0, publishedAt: new Date().toISOString(), episodes };
+        await request('/templates', { method: 'POST', body: JSON.stringify(payload) });
+        created++;
+      } catch (e) { failures.push(`第 ${excelRow} 行：${e instanceof Error ? e.message : '导入失败'}`); }
+    }
+    await load();
+    if (failures.length) {
+      error.value = `已导入 ${created} 行，${failures.length} 行失败：${failures.join('；')}`;
+      if (created) notice.value = `成功创建 ${created} 个${typeLabel.value}模板`;
+    } else notice.value = `成功创建 ${created} 个${typeLabel.value}模板`;
+  } catch (e) { error.value = e instanceof Error ? e.message : 'Excel 导入失败'; }
+  finally { importing.value = false; loading.value = false; }
 }
 function handleDrop(event: DragEvent, assign: (url: string) => void) {
   event.preventDefault();
@@ -213,6 +350,7 @@ onMounted(() => { void load(); });
         <aside class="catalog">
           <div class="type-tabs" role="tablist"><button :class="{ active: activeType === 'COMIC_DRAMA' }" @click="selectType('COMIC_DRAMA')">漫剧</button><button :class="{ active: activeType === 'SHORT_VIDEO' }" @click="selectType('SHORT_VIDEO')">视频</button><button :class="{ active: activeType === 'IMAGE_GENERATION' }" @click="selectType('IMAGE_GENERATION')">图片</button></div>
           <div class="catalog-header"><span>{{ activeType === 'COMIC_DRAMA' ? '漫剧' : activeType === 'SHORT_VIDEO' ? '视频' : '图片' }}模板</span><span class="count">{{ visibleTemplates.length }}</span></div>
+          <div class="excel-actions"><button type="button" class="secondary" @click="downloadExcelTemplate">下载 Excel 模板</button><button type="button" class="secondary" :disabled="importing" @click="importInput?.click()">{{ importing ? '正在导入…' : '导入 Excel' }}</button><input ref="importInput" type="file" accept=".xlsx,.xls" hidden @change="importExcel" /></div>
           <div class="search-row"><span>⌕</span><input placeholder="搜索模板" /></div>
           <div v-if="!visibleTemplates.length" class="empty-list">{{ loading ? '正在加载…' : '暂无模板' }}</div>
           <button v-for="item in visibleTemplates" :key="item.id" type="button" class="template-row" :class="{ selected: selectedId === item.id }" @click="openTemplate(item)">
