@@ -69,14 +69,14 @@ function workbookTemplate() {
   const common = [
     ['模板名称（必填）', 'title'], ['唯一标识（必填）', 'slug'], ['分类（必填）', 'category'],
     [activeType.value === 'COMIC_DRAMA' ? '描述（必填）' : '生成提示词（必填）', 'description'],
-    ['封面图链接或图片（必填）', 'coverUrl'], ['标签（逗号分隔）', 'tags'],
+    ['封面图链接（必填，可插入图片）', 'coverUrl'], ['标签（逗号分隔）', 'tags'],
     ['状态（DRAFT/PUBLISHED/ARCHIVED）', 'status'], ['启用（是/否）', 'active'], ['付费（是/否）', 'premium'], ['排序权重', 'sortOrder'],
   ];
-  const comic = [['目标受众', 'audience'], ['市场评分', 'marketScore'], ['故事背景 JSON', 'storyBackground'], ['剧集序号（必填）', 'episodeNumber'], ['剧集标题（必填）', 'episodeTitle'], ['剧集简介', 'episodeSynopsis'], ['模型编码（必填）', 'modelCode'], ['正向提示词（必填）', 'promptTemplate'], ['负向提示词', 'negativePrompt']];
+  const comic = [['目标受众', 'audience'], ['故事背景 JSON', 'storyBackground'], ['剧集序号（必填）', 'episodeNumber'], ['剧集标题（必填）', 'episodeTitle'], ['剧集简介', 'episodeSynopsis'], ['模型编码（必填）', 'modelCode'], ['正向提示词（必填）', 'promptTemplate'], ['负向提示词', 'negativePrompt']];
   const columns = activeType.value === 'COMIC_DRAMA' ? [...common, ...comic] : common;
   const headers = columns.map(([label]) => label);
-  const sample: Record<string, unknown> = { title: '示例模板', slug: `example-${activeType.value.toLowerCase()}`, category: '示例分类', description: '在此填写模板描述或生成提示词', coverUrl: 'https://example.com/cover.jpg', tags: '示例,标签', status: 'DRAFT', active: '是', premium: '否', sortOrder: 0 };
-  if (activeType.value === 'COMIC_DRAMA') Object.assign(sample, { audience: '', marketScore: 0, storyBackground: '{}', episodeNumber: 1, episodeTitle: '第 1 集', episodeSynopsis: '', modelCode: models.value[0]?.code || '从模型列表选择编码', promptTemplate: '在此填写剧集正向提示词', negativePrompt: '' });
+  const sample: Record<string, unknown> = { title: '', slug: '', category: '', description: '', coverUrl: '', tags: '', status: 'DRAFT', active: '是', premium: '否', sortOrder: 0 };
+  if (activeType.value === 'COMIC_DRAMA') Object.assign(sample, { audience: '', storyBackground: '{}', episodeNumber: 1, episodeTitle: '', episodeSynopsis: '', modelCode: models.value[0]?.code || '', promptTemplate: '', negativePrompt: '' });
   return { columns, headers, sample: columns.map(([, key]) => sample[key as string] ?? '') };
 }
 function downloadExcelTemplate() {
@@ -90,14 +90,24 @@ function downloadExcelTemplate() {
   sheet['!cols'] = template.headers.map(() => ({ wch: 26 }));
   const workbook = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(workbook, sheet, typeLabel.value);
+  const help = XLSX.utils.aoa_to_sheet([
+    ['填写说明'],
+    ['每行对应一个模板；漫剧支持同一模板多行，每行代表一集，slug 相同的行会合并为同一漫剧。'],
+    ['多集漫剧每行都填写相同 slug；模板基本信息可只填写第一行，后续行会从该 slug 的首行补齐。'],
+    ['封面可填写图片 URL，也可在 Excel 中将图片插入对应数据行。若两者同时提供，使用 URL。'],
+    ['带“（必填）”的列必须填写。删除此说明工作表不会影响导入；请勿修改或删除首个工作表的标题行。'],
+  ]);
+  XLSX.utils.book_append_sheet(workbook, help, '填写说明');
   XLSX.writeFile(workbook, `Vilo-${typeLabel.value}-模板导入表.xlsx`);
 }
-type EmbeddedImage = { row: number; file: File };
-function extractEmbeddedImages(buffer: ArrayBuffer): EmbeddedImage[] {
+type EmbeddedImage = { row: number; file: File; sheetName: string };
+function extractEmbeddedImages(buffer: ArrayBuffer, requestedSheetName: string): EmbeddedImage[] {
   const files = unzipSync(new Uint8Array(buffer));
   const workbookXml = new TextDecoder().decode(files['xl/workbook.xml'] || new Uint8Array());
   const relsXml = new TextDecoder().decode(files['xl/_rels/workbook.xml.rels'] || new Uint8Array());
-  const sheetId = workbookXml.match(/<sheet\b[^>]*r:id="([^"]+)"/i)?.[1];
+  const sheetEntry = (workbookXml.match(/<sheet\b[^>]*\/?\s*>/gi) || []).find((tag) => tag.match(/\bname="([^"]+)"/i)?.[1] === requestedSheetName);
+  const sheetId = sheetEntry?.match(/\br:id="([^"]+)"/i)?.[1];
+  const sheetName = requestedSheetName;
   const relationshipTarget = (xml: string, id: string) => {
     for (const relationship of xml.matchAll(/<Relationship\b[^>]*\/?\s*>/gi)) {
       if (relationship[0].match(/\bId="([^"]+)"/i)?.[1] === id) return relationship[0].match(/\bTarget="([^"]+)"/i)?.[1] || null;
@@ -112,7 +122,7 @@ function extractEmbeddedImages(buffer: ArrayBuffer): EmbeddedImage[] {
     for (const part of parts) { if (!part || part === '.') continue; if (part === '..') normalized.pop(); else normalized.push(part); }
     return normalized.join('/');
   };
-  const sheetPath = normalizePath('', sheetTarget.startsWith('/') ? sheetTarget : `xl/${sheetTarget}`);
+  const sheetPath = normalizePath('xl', sheetTarget);
   const sheetXml = new TextDecoder().decode(files[sheetPath] || new Uint8Array());
   const drawingRelId = sheetXml.match(/<drawing\b[^>]*r:id="([^"]+)"/i)?.[1];
   const sheetRelPath = sheetPath.replace(/([^/]+)$/, '_rels/$1.rels');
@@ -124,9 +134,10 @@ function extractEmbeddedImages(buffer: ArrayBuffer): EmbeddedImage[] {
   const drawingRelPath = drawingPath.replace(/([^/]+)$/, '_rels/$1.rels');
   const drawingRels = new TextDecoder().decode(files[drawingRelPath] || new Uint8Array());
   const images: EmbeddedImage[] = [];
-  for (const anchor of drawingXml.matchAll(/<(?:xdr:)?(?:oneCellAnchor|twoCellAnchor)\b[\s\S]*?<\/(?:xdr:)?(?:oneCellAnchor|twoCellAnchor)>/gi)) {
-    const row = Number(anchor[0].match(/<(?:xdr:)?from>[\s\S]*?<(?:xdr:)?row>(\d+)<\/(?:xdr:)?row>/i)?.[1]);
-    const relId = anchor[0].match(/<(?:a:)?blip\b[^>]*(?:r:embed|embed)="([^"]+)"/i)?.[1];
+  const anchors = drawingXml.match(/<(?:\w+:)?(?:oneCellAnchor|twoCellAnchor)\b[\s\S]*?<\/(?:\w+:)?(?:oneCellAnchor|twoCellAnchor)>/gi) || [];
+  for (const anchor of anchors) {
+    const row = Number(anchor.match(/<(?:\w+:)?from\b[^>]*>[\s\S]*?<(?:\w+:)?row>(\d+)<\/(?:\w+:)?row>/i)?.[1]);
+    const relId = anchor.match(/<(?:\w+:)?blip\b[^>]*(?:r:embed|embed)="([^"]+)"/i)?.[1];
     const target = relId ? relationshipTarget(drawingRels, relId) : null;
     if (!Number.isFinite(row) || !target) continue;
     const path = normalizePath(drawingPath.slice(0, drawingPath.lastIndexOf('/')), target);
@@ -134,7 +145,7 @@ function extractEmbeddedImages(buffer: ArrayBuffer): EmbeddedImage[] {
     if (!bytes) continue;
     const ext = path.split('.').pop()?.toLowerCase() || 'png';
     const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'gif' ? 'image/gif' : ext === 'webp' ? 'image/webp' : 'image/png';
-    images.push({ row: row + 1, file: new File([bytes], `excel-cover-${row + 1}.${ext}`, { type: mime }) });
+    images.push({ row: row + 1, file: new File([bytes], `excel-cover-${row + 1}.${ext}`, { type: mime }), sheetName });
   }
   return images;
 }
@@ -148,36 +159,85 @@ async function importExcel(event: Event) {
   try {
     const buffer = await file.arrayBuffer();
     const workbook = XLSX.read(buffer, { type: 'array', cellDates: false });
-    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    const sheetName = workbook.SheetNames.find((name) => !['填写说明', '说明'].includes(name)) || workbook.SheetNames[0];
+    const sheet = workbook.Sheets[sheetName];
     if (!sheet) throw new Error('Excel 中没有可读取的工作表');
-    const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '', raw: false });
-    if (!rows.length) throw new Error('Excel 中没有数据行');
+    const matrix = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1, defval: '', raw: false, blankrows: false });
+    const headers = (matrix[0] || []).map((header) => nonEmpty(header));
+    const dataRows = matrix.slice(1);
+    if (!headers.length || !dataRows.length) throw new Error('Excel 中没有标题行或数据行');
     const columnTemplate = workbookTemplate();
-    const headerToKey = new Map(columnTemplate.headers.map((label, index) => [label, columnTemplate.columns[index][1] as string]));
-    const mapped = rows.map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [headerToKey.get(key.trim()) || key.trim().replace(/（必填）/g, ''), value])));
-    const embedded = extractEmbeddedImages(buffer);
+    const normalized = (value: string) => value.trim().replace(/\s/g, '').replace(/[（(]必填[）)]/g, '').replace(/[：:]/g, '').toLowerCase();
+    const headerToKey = new Map(columnTemplate.headers.map((label, index) => [normalized(label), columnTemplate.columns[index][1] as string]));
+    const aliases: Record<string, string> = { 封面图: 'coverUrl', 封面图片: 'coverUrl', 封面图链接: 'coverUrl', 封面链接: 'coverUrl', 提示词: 'description', 生成提示词: 'description', 模板描述: 'description', 模板名称: 'title', 模板标题: 'title', 唯一标识: 'slug', slug: 'slug', 分类: 'category', 标签: 'tags', 剧集序号: 'episodeNumber', 剧集标题: 'episodeTitle', 模型编码: 'modelCode', 正向提示词: 'promptTemplate', 负向提示词: 'negativePrompt' };
+    const keys = headers.map((header) => headerToKey.get(normalized(header)) || aliases[normalized(header)] || '');
+    const missingHeaders = columnTemplate.headers.filter((label) => label.includes('（必填）') && !keys.includes(columnTemplate.columns[columnTemplate.headers.indexOf(label)][1] as string));
+    if (missingHeaders.length) throw new Error(`缺少必填列：${missingHeaders.join('、')}`);
+    const mapped = dataRows.map((cells) => Object.fromEntries(keys.flatMap((key, index) => key ? [[key, cells[index] ?? '']] : [])));
+    const embedded = extractEmbeddedImages(buffer, sheetName);
     let created = 0;
     const failures: string[] = [];
-    for (let index = 0; index < mapped.length; index++) {
-      const row = mapped[index];
-      const excelRow = index + 2;
+    const imageRows = embedded.filter((image) => image.sheetName === sheetName);
+    const importRows = mapped.map((row, index) => ({ row, excelRow: index + 2 })).filter(({ row, excelRow }) => {
+      const hasValues = Object.values(row).some((value) => nonEmpty(value));
+      const hasImage = imageRows.some((image) => image.row === excelRow);
+      if (activeType.value === 'COMIC_DRAMA' && !hasValues && !hasImage) return false;
+      return hasValues || hasImage;
+    });
+    const groups = new Map<string, { row: Record<string, unknown>; excelRow: number; episodes: Array<{ row: Record<string, unknown>; excelRow: number }> }>();
+    for (const item of importRows) {
+      if (activeType.value !== 'COMIC_DRAMA') {
+        groups.set(`row-${item.excelRow}`, { ...item, episodes: [] });
+        continue;
+      }
+      const slug = nonEmpty(item.row.slug);
+      if (!slug) {
+        failures.push(`第 ${item.excelRow} 行：漫剧每一集行都必须填写同一个模板唯一标识`);
+        continue;
+      }
+      let group = groups.get(slug);
+      if (!group) {
+        group = { ...item, episodes: [] };
+        groups.set(slug, group);
+      } else {
+        const merged = { ...group.row };
+        for (const [key, value] of Object.entries(item.row)) if (!nonEmpty(merged[key]) && nonEmpty(value)) merged[key] = value;
+        group.row = merged;
+      }
+      group.episodes.push(item);
+    }
+    for (const group of groups.values()) {
+      const row = group.row;
+      const excelRow = group.excelRow;
       try {
         let coverUrl = nonEmpty(row.coverUrl);
-        const image = embedded.find((item) => item.row === excelRow);
+        if (coverUrl && !/^https?:\/\//i.test(coverUrl)) throw new Error('封面图列仅接受 http/https 图片链接；也可以留空并插入该行的图片');
+        const image = imageRows.find((item) => item.row === excelRow) || group.episodes.map((episode) => imageRows.find((item) => item.row === episode.excelRow)).find(Boolean);
         if (!coverUrl && image) coverUrl = await uploadAssetFile(image.file);
         if (!coverUrl) throw new Error('封面图链接或图片必填');
         const title = nonEmpty(row.title), slug = nonEmpty(row.slug), category = nonEmpty(row.category), description = nonEmpty(row.description);
         if (!title || !slug || !category || !description) throw new Error('模板名称、唯一标识、分类、描述/生成提示词均必填');
         const tags = nonEmpty(row.tags).split(/[,，]/).map((tag) => tag.trim()).filter(Boolean);
         const booleanValue = (value: unknown, fallback: boolean) => value === '' || value === undefined ? fallback : ['是', 'true', '1', 'yes', 'y'].includes(nonEmpty(value).toLowerCase());
+        if (activeType.value === 'COMIC_DRAMA' && new Set(group.episodes.map((episode) => Number(episode.row.episodeNumber))).size !== group.episodes.length) throw new Error('同一模板的剧集序号不能重复');
         const episodes: Episode[] = [];
         if (activeType.value === 'COMIC_DRAMA') {
-          const episodeNumber = Number(row.episodeNumber), episodeTitle = nonEmpty(row.episodeTitle);
-          const modelCode = nonEmpty(row.modelCode), promptTemplate = nonEmpty(row.promptTemplate);
-          if (!Number.isInteger(episodeNumber) || episodeNumber < 1 || !episodeTitle || !modelCode || !promptTemplate || !models.value.some((model) => model.code === modelCode)) throw new Error('剧集序号、剧集标题、可选模型编码和正向提示词均必填');
-          episodes.push({ ...emptyEpisode(episodeNumber), number: episodeNumber, title: episodeTitle, synopsis: nonEmpty(row.episodeSynopsis), modelCode, promptTemplate, negativePrompt: nonEmpty(row.negativePrompt), parameters: {} });
+          for (const episodeRow of group.episodes) {
+            const episodeNumber = Number(episodeRow.row.episodeNumber), episodeTitle = nonEmpty(episodeRow.row.episodeTitle);
+            const modelCode = nonEmpty(episodeRow.row.modelCode), promptTemplate = nonEmpty(episodeRow.row.promptTemplate);
+            if (!Number.isInteger(episodeNumber) || episodeNumber < 1 || !episodeTitle || !modelCode || !promptTemplate || !models.value.some((model) => model.code === modelCode)) throw new Error(`第 ${episodeRow.excelRow} 行：剧集序号、标题、可选模型编码和正向提示词必填`);
+            const model = models.value.find((item) => item.code === modelCode)!;
+            const parameters = Object.fromEntries(model.params.filter((param) => param.key !== 'duration').map((param) => [param.key, defaultParamValue(param)]));
+            const missingParams = model.params.filter((param) => param.required && param.defaultValue === null && !param.options.some((option) => option.isDefault)).filter((param) => parameters[param.key] === '');
+            if (missingParams.length) throw new Error(`第 ${episodeRow.excelRow} 行：模型「${model.name}」缺少必填参数默认值（${missingParams.map((param) => param.label).join('、')}），请先在模型配置中设置默认值`);
+            episodes.push({ ...emptyEpisode(episodeNumber), number: episodeNumber, title: episodeTitle, synopsis: nonEmpty(episodeRow.row.episodeSynopsis), modelCode, promptTemplate, negativePrompt: nonEmpty(episodeRow.row.negativePrompt), parameters });
+          }
         }
-        const payload = { slug, title, type: activeType.value, category, genreId: null, description, storyBackground: activeType.value === 'COMIC_DRAMA' && nonEmpty(row.storyBackground) ? JSON.parse(nonEmpty(row.storyBackground)) : {}, coverUrl, tags, audience: nonEmpty(row.audience) || null, marketScore: Number(row.marketScore) || 0, sourceMeta: null, status: ['PUBLISHED', 'ARCHIVED'].includes(nonEmpty(row.status).toUpperCase()) ? nonEmpty(row.status).toUpperCase() : 'DRAFT', premium: booleanValue(row.premium, false), active: booleanValue(row.active, true), sortOrder: Number(row.sortOrder) || 0, publishedAt: new Date().toISOString(), episodes };
+        const sortOrder = Number(row.sortOrder) || 0;
+        if (!Number.isInteger(sortOrder)) throw new Error('排序权重必须为整数');
+        const status = nonEmpty(row.status).toUpperCase() || 'DRAFT';
+        if (!['DRAFT', 'PUBLISHED', 'ARCHIVED'].includes(status)) throw new Error('状态仅支持 DRAFT、PUBLISHED、ARCHIVED');
+        const payload = { slug, title, type: activeType.value, category, genreId: null, description, storyBackground: activeType.value === 'COMIC_DRAMA' && nonEmpty(row.storyBackground) ? JSON.parse(nonEmpty(row.storyBackground)) : {}, coverUrl, tags, audience: nonEmpty(row.audience) || null, sourceMeta: null, status, premium: booleanValue(row.premium, false), active: booleanValue(row.active, true), sortOrder, publishedAt: new Date().toISOString(), episodes };
         await request('/templates', { method: 'POST', body: JSON.stringify(payload) });
         created++;
       } catch (e) { failures.push(`第 ${excelRow} 行：${e instanceof Error ? e.message : '导入失败'}`); }
@@ -365,7 +425,7 @@ onMounted(() => { void load(); });
           <div class="tabbar"><button class="tab active">{{ draft.type === 'COMIC_DRAMA' ? '漫剧模板信息' : draft.type === 'SHORT_VIDEO' ? '视频模板信息' : '图片模板信息' }}</button><template v-if="isComicDrama"><span class="divider"></span><button class="tab active">剧集配置</button></template><span class="spacer"></span><span class="saved-label">{{ draft.status }}</span></div>
           <div class="editor-content">
             <section class="form-section"><div class="section-title"><div><h3>基本信息</h3><p>模板在客户端展示的名称、分类和封面</p></div></div>
-              <div class="form-grid"><label>模板名称<input v-model="draft.title" maxlength="200" placeholder="输入模板名称" /></label><label>唯一标识<input v-model="draft.slug" maxlength="160" placeholder="例如: neon-dream" /></label><label>类型><input :value="draft.type === 'COMIC_DRAMA' ? '漫剧' : draft.type === 'SHORT_VIDEO' ? '视频' : '图片'" readonly /></label><label>分类<input v-model="draft.category" placeholder="例如：科幻 / 爱情" /></label><label class="span-2 asset-field">封面图<div class="asset-drop" @dragover.prevent @drop="handleDrop($event, (url) => draft!.coverUrl = url)" @click="chooseFile((url) => draft!.coverUrl = url)"><img v-if="draft.coverUrl" :src="draft.coverUrl" alt="封面预览" /><span v-else>拖拽图片到这里，或点击上传</span></div><input :value="draft.coverUrl" readonly placeholder="上传完成后显示阿里云链接" /></label><label class="span-2">{{ isComicDrama ? '描述' : '生成提示词' }}<textarea v-model="draft.description" rows="4" :placeholder="isComicDrama ? '模板简介' : '描述希望生成的画面、风格与内容'" /></label><label>状态<select v-model="draft.status"><option value="DRAFT">草稿</option><option value="PUBLISHED">已发布</option><option value="ARCHIVED">已归档</option></select></label><label>标签<input :value="draft.tags.join(', ')" placeholder="逗号分隔" @input="draft.tags = ($event.target as HTMLInputElement).value.split(',').map((tag) => tag.trim()).filter(Boolean)" /></label><label v-if="isComicDrama">目标受众<input v-model="draft.audience" placeholder="可选" /></label><label v-if="isComicDrama">市场评分<input v-model.number="draft.marketScore" type="number" min="0" max="100" step="0.01" /></label></div>
+              <div class="form-grid"><label>模板名称<input v-model="draft.title" maxlength="200" placeholder="输入模板名称" /></label><label>唯一标识<input v-model="draft.slug" maxlength="160" placeholder="例如: neon-dream" /></label><label>类型><input :value="draft.type === 'COMIC_DRAMA' ? '漫剧' : draft.type === 'SHORT_VIDEO' ? '视频' : '图片'" readonly /></label><label>分类<input v-model="draft.category" placeholder="例如：科幻 / 爱情" /></label><label class="span-2 asset-field">封面图<div class="asset-drop" @dragover.prevent @drop="handleDrop($event, (url) => draft!.coverUrl = url)" @click="chooseFile((url) => draft!.coverUrl = url)"><img v-if="draft.coverUrl" :src="draft.coverUrl" alt="封面预览" /><span v-else>拖拽图片到这里，或点击上传</span></div><input :value="draft.coverUrl" readonly placeholder="上传完成后显示阿里云链接" /></label><label class="span-2">{{ isComicDrama ? '描述' : '生成提示词' }}<textarea v-model="draft.description" rows="4" :placeholder="isComicDrama ? '模板简介' : '描述希望生成的画面、风格与内容'" /></label><label>状态<select v-model="draft.status"><option value="DRAFT">草稿</option><option value="PUBLISHED">已发布</option><option value="ARCHIVED">已归档</option></select></label><label>标签<input :value="draft.tags.join(', ')" placeholder="逗号分隔" @input="draft.tags = ($event.target as HTMLInputElement).value.split(',').map((tag) => tag.trim()).filter(Boolean)" /></label><label v-if="isComicDrama">目标受众<input v-model="draft.audience" placeholder="可选" /></label></div>
               <div class="switch-row"><label><input v-model="draft.active" type="checkbox" /> 启用模板</label><label><input v-model="draft.premium" type="checkbox" /> 付费模板</label><label>排序权重 <input v-model.number="draft.sortOrder" type="number" class="short-input" /></label></div>
               <details v-if="isComicDrama" class="advanced-fields"><summary>故事背景与来源数据</summary><div class="form-grid"><label>故事背景 JSON<textarea :value="JSON.stringify(draft.storyBackground, null, 2)" rows="5" @change="parseJsonField($event, (value) => { draft!.storyBackground = value; })"></textarea></label><label>来源元数据 JSON<textarea :value="JSON.stringify(draft.sourceMeta, null, 2)" rows="5" @change="parseJsonField($event, (value) => { draft!.sourceMeta = value; })"></textarea></label><label>题材 ID<input v-model="draft.genreId" placeholder="数据库 Genre ID，可留空" /></label></div></details>
             </section>
