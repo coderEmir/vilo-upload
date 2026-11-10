@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-APP_DIR="${ROOT_DIR}/uploadPlatform"
+APP_DIR="${ROOT_DIR}"
 WEB_ROOT="${WEB_ROOT:-/var/www/vilo-upload}"
 VITE_API_BASE="${VITE_API_BASE:-/template-api}"
 RELEASE_DIR="${WEB_ROOT}.release.$$"
