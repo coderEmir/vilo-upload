@@ -2,16 +2,13 @@
 import { computed, onMounted, ref, toRaw } from 'vue';
 import * as XLSX from 'xlsx';
 import { unzipSync } from 'fflate';
+import { modelMatchesTemplateType, resolveTemplateModel, type Model, type ModelParam, type TemplateType } from './template-models';
 
-type ModelOption = { value: string; label: string; isDefault: boolean; thumbnail?: string | null };
-type ModelParam = { key: string; label: string; description?: string | null; type: string; required: boolean; defaultValue?: string | null; min?: number | null; max?: number | null; unit?: string | null; options: ModelOption[] };
-type Model = { id: string; code: string; name: string; modality: string; params: ModelParam[] };
 type Episode = { id?: string; number: number; title: string; synopsis: string; storyBeat: unknown; durationSeconds: number | null; minDurationSeconds: number; maxDurationSeconds: number; mediaAssets: unknown[]; referenceAssets: unknown[]; agents: unknown[]; promptTemplate: string; negativePrompt: string | null; defaultParams: Record<string, unknown> | null; premium: boolean; active: boolean; modelCode: string; parameters: Record<string, unknown> };
 type Template = { id: string; slug: string; title: string; type: string; category: string; genreId: string | null; description: string; storyBackground: unknown; coverUrl: string; tags: string[]; audience: string | null; marketScore: number; sourceMeta: unknown; status: string; premium: boolean; active: boolean; sortOrder: number; publishedAt: string | null; episodes: Episode[] };
 const apiBase = (import.meta.env.VITE_API_BASE || '/template-api').replace(/\/$/, '');
 const adminKey = ref(localStorage.getItem('templateAdminKey') || '');
 const templates = ref<Template[]>([]);
-type TemplateType = 'COMIC_DRAMA' | 'SHORT_VIDEO' | 'IMAGE_GENERATION';
 const activeType = ref<TemplateType>('SHORT_VIDEO');
 const isCreating = ref(false);
 const models = ref<Model[]>([]);
@@ -29,13 +26,13 @@ const selectedModel = computed(() => models.value.find((model) => model.code ===
 const visibleTemplates = computed(() => templates.value.filter((template) => template.type === activeType.value));
 const isComicDrama = computed(() => draft.value?.type === 'COMIC_DRAMA' || draft.value?.type === 'MV');
 const typeLabel = computed(() => activeType.value === 'COMIC_DRAMA' ? '漫剧' : activeType.value === 'SHORT_VIDEO' ? '视频' : '图片');
-const availableModels = computed(() => models.value.filter((model) => activeType.value === 'IMAGE_GENERATION' ? model.modality === 'IMAGE' : model.modality === 'VIDEO'));
+const availableModels = computed(() => models.value.filter((model) => modelMatchesTemplateType(model, activeType.value)));
 const templateControlledParams = computed(() => selectedModel.value?.params.filter(isTemplateControlledParam) || []);
 const userControlledParamKeys = new Set(['aspectratio', 'ratio', 'resolution', 'size', 'image', 'imageurl', 'referenceimage', 'referenceimages']);
 function canonicalParamKey(key: string): string { return key.replace(/[^a-z0-9]/gi, '').toLowerCase(); }
 function isTemplateControlledParam(param: ModelParam): boolean { return !userControlledParamKeys.has(canonicalParamKey(param.key)); }
 function hasParamValue(value: unknown): boolean { return value !== undefined && value !== null && value !== ''; }
-function modelForType(type: TemplateType): Model | undefined { return models.value.find((model) => type === 'IMAGE_GENERATION' ? model.modality === 'IMAGE' : type === 'SHORT_VIDEO' ? model.modality === 'VIDEO' : true); }
+function modelForType(type: TemplateType): Model | undefined { return models.value.find((model) => modelMatchesTemplateType(model, type)); }
 function excelParamKey(key: string): string { return `parameter:${key}`; }
 function defaultParamValue(param: ModelParam): unknown {
   const value = param.defaultValue ?? param.options.find((option) => option.isDefault)?.value;
@@ -81,8 +78,8 @@ function workbookTemplate() {
     ['封面图链接（必填，可插入图片）', 'coverUrl'], ['标签（逗号分隔）', 'tags'],
     ['状态（DRAFT/PUBLISHED/ARCHIVED）', 'status'], ['启用（是/否）', 'active'], ['付费（是/否）', 'premium'], ['排序权重', 'sortOrder'],
   ];
-  const comic = [['目标受众', 'audience'], ['故事背景 JSON', 'storyBackground'], ['剧集序号（必填）', 'episodeNumber'], ['剧集标题（必填）', 'episodeTitle'], ['剧集简介', 'episodeSynopsis'], ['模型编码（必填）', 'modelCode'], ['正向提示词（必填）', 'promptTemplate'], ['负向提示词', 'negativePrompt']];
-  const generation = [['模型编码（必填）', 'modelCode'], ['生成提示词（必填）', 'promptTemplate'], ['负向提示词', 'negativePrompt']];
+  const comic = [['目标受众', 'audience'], ['故事背景 JSON', 'storyBackground'], ['剧集序号（必填）', 'episodeNumber'], ['剧集标题（必填）', 'episodeTitle'], ['剧集简介', 'episodeSynopsis'], ['模型编码或名称（必填）', 'modelCode'], ['正向提示词（必填）', 'promptTemplate'], ['负向提示词', 'negativePrompt']];
+  const generation = [['模型编码或名称（必填）', 'modelCode'], ['生成提示词（必填）', 'promptTemplate'], ['负向提示词', 'negativePrompt']];
   const seen = new Set<string>();
   const parameterColumns = availableModels.value.flatMap((model) => model.params.filter((param) => param.required && isTemplateControlledParam(param)))
     .filter((param) => !seen.has(param.key) && seen.add(param.key))
@@ -112,7 +109,8 @@ function downloadExcelTemplate() {
   const help = XLSX.utils.aoa_to_sheet([
     ['填写说明'],
     [activeType.value === 'COMIC_DRAMA' ? '每行代表一集，slug 相同的行合并为同一漫剧。' : '每行对应一个图片或视频模板。'],
-    [activeType.value === 'COMIC_DRAMA' ? '多集漫剧每行填写同一 slug；基本信息可只填写第一行。' : '模型编码决定该行的必填模型参数，导入时严格按后端模型配置校验。'],
+    [activeType.value === 'COMIC_DRAMA' ? '多集漫剧每行填写同一 slug；基本信息可只填写第一行。' : '模型编码或名称决定该行的必填模型参数，导入时严格按后端模型配置校验。'],
+    [`可用模型：${availableModels.value.map((model) => `${model.name} (${model.code})`).join('；')}`],
     [activeType.value === 'COMIC_DRAMA' ? '漫剧上传入口当前隐藏，但原批量导入能力保留。' : '图片上传、画面比例、分辨率由客户端用户选择，不在模板参数中填写。'],
     ['封面可填写图片 URL，也可在 Excel 中将图片插入对应数据行。若两者同时提供，使用 URL。'],
     ['带“（必填）”的列必须填写。删除此说明工作表不会影响导入；请勿修改或删除首个工作表的标题行。'],
@@ -236,18 +234,18 @@ async function importExcel(event: Event) {
           if (new Set(group.episodes.map((episode) => Number(episode.row.episodeNumber))).size !== group.episodes.length) throw new Error('同一模板的剧集序号不能重复');
           for (const episodeRow of group.episodes) {
             const episodeNumber = Number(episodeRow.row.episodeNumber), episodeTitle = nonEmpty(episodeRow.row.episodeTitle);
-            const modelCode = nonEmpty(episodeRow.row.modelCode), promptTemplate = nonEmpty(episodeRow.row.promptTemplate);
-            const model = models.value.find((item) => item.code === modelCode);
-            if (!Number.isInteger(episodeNumber) || episodeNumber < 1 || !episodeTitle || !model || !promptTemplate) throw new Error(`第 ${episodeRow.excelRow} 行：剧集序号、标题、可选模型编码和正向提示词必填`);
+            const modelReference = nonEmpty(episodeRow.row.modelCode), promptTemplate = nonEmpty(episodeRow.row.promptTemplate);
+            const model = resolveTemplateModel(models.value, modelReference, activeType.value);
+            if (!Number.isInteger(episodeNumber) || episodeNumber < 1 || !episodeTitle || !model || !promptTemplate) throw new Error(`第 ${episodeRow.excelRow} 行：剧集序号、标题、有效模型编码/名称和正向提示词必填`);
             const parameters = Object.fromEntries(model.params.map((param) => [param.key, defaultParamValue(param)]));
             const missingParams = model.params.filter((param) => param.required && !hasParamValue(parameters[param.key]));
             if (missingParams.length) throw new Error(`第 ${episodeRow.excelRow} 行：模型「${model.name}」缺少必填参数默认值（${missingParams.map((param) => param.label).join('、')}），请先在模型配置中设置默认值`);
-            episodes.push({ ...emptyEpisode(episodeNumber, model), number: episodeNumber, title: episodeTitle, synopsis: nonEmpty(episodeRow.row.episodeSynopsis), modelCode, promptTemplate, negativePrompt: nonEmpty(episodeRow.row.negativePrompt), parameters });
+            episodes.push({ ...emptyEpisode(episodeNumber, model), number: episodeNumber, title: episodeTitle, synopsis: nonEmpty(episodeRow.row.episodeSynopsis), modelCode: model.code, promptTemplate, negativePrompt: nonEmpty(episodeRow.row.negativePrompt), parameters });
           }
         } else {
-          const modelCode = nonEmpty(row.modelCode), promptTemplate = nonEmpty(row.promptTemplate);
-          const model = availableModels.value.find((item) => item.code === modelCode);
-          if (!model || !promptTemplate) throw new Error('可选模型编码和生成提示词必填');
+          const modelReference = nonEmpty(row.modelCode), promptTemplate = nonEmpty(row.promptTemplate);
+          const model = resolveTemplateModel(models.value, modelReference, activeType.value);
+          if (!model || !promptTemplate) throw new Error('有效模型编码/名称和生成提示词必填');
           const parameters = Object.fromEntries(model.params.filter(isTemplateControlledParam).map((param) => {
             const imported = row[excelParamKey(param.key)];
             const value = hasParamValue(imported) ? imported : defaultParamValue(param);
@@ -257,7 +255,7 @@ async function importExcel(event: Event) {
           }));
           const missingParams = model.params.filter((param) => param.required && isTemplateControlledParam(param) && !hasParamValue(parameters[param.key]));
           if (missingParams.length) throw new Error(`模型「${model.name}」缺少必填参数：${missingParams.map((param) => param.label).join('、')}`);
-          episodes.push({ ...emptyEpisode(1, model), title, synopsis: description, modelCode, promptTemplate, negativePrompt: nonEmpty(row.negativePrompt), parameters });
+          episodes.push({ ...emptyEpisode(1, model), title, synopsis: description, modelCode: model.code, promptTemplate, negativePrompt: nonEmpty(row.negativePrompt), parameters });
         }
         const sortOrder = Number(row.sortOrder) || 0;
         if (!Number.isInteger(sortOrder)) throw new Error('排序权重必须为整数');
