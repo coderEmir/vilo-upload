@@ -7,4 +7,18 @@ Vue 3 + Vite template management UI.
 3. Run `npm install` and `npm run dev` from this directory.
 4. Enter the management key in the page footer. It is stored in browser local storage.
 
-The management API is `GET/POST /api/templates` and `PATCH/DELETE /api/templates/:id`. Episode list changes are synchronized in one database transaction while preserving IDs for retained episodes.
+The top navigation separates the existing template catalog from the subject-remix workspace.
+
+- Template CRUD uses the independent `vilo-template` service on port `3010`.
+- Subject replacement uses the independent `vilo-template-remix-api` service on port `3020` and `vilo-template-remix-worker` for queued provider work.
+- Production Nginx routes `/template-api` and `/remix-api` independently.
+
+PM2 can start or restart each backend surface separately:
+
+```bash
+pm2 start ecosystem.config.js --only vilo-template --env production
+pm2 start ecosystem.config.js --only vilo-template-remix-api --env production
+pm2 start ecosystem.config.js --only vilo-template-remix-worker --env production
+```
+
+The management API is `GET/POST /api/templates` and `PATCH/DELETE /api/templates/:id`. Subject-remix candidates enter the formal template catalog through the same server-owned validation and persistence service as manual uploads.

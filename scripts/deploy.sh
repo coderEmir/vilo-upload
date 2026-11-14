@@ -6,6 +6,7 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 APP_DIR="${ROOT_DIR}"
 WEB_ROOT="${WEB_ROOT:-/var/www/vilo-upload}"
 VITE_API_BASE="${VITE_API_BASE:-/template-api}"
+VITE_REMIX_API_BASE="${VITE_REMIX_API_BASE:-/remix-api}"
 RELEASE_DIR="${WEB_ROOT}.release.$$"
 BACKUP_DIR="${WEB_ROOT}.previous"
 
@@ -19,16 +20,18 @@ trap cleanup EXIT
 [[ "${WEB_ROOT}" != "/" ]] || die "WEB_ROOT 不允许为根目录"
 [[ "${VITE_API_BASE}" == /* || "${VITE_API_BASE}" =~ ^https?:// ]] \
   || die "VITE_API_BASE 必须是 / 开头的同源路径或 http(s) 地址"
+[[ "${VITE_REMIX_API_BASE}" == /* || "${VITE_REMIX_API_BASE}" =~ ^https?:// ]] \
+  || die "VITE_REMIX_API_BASE 必须是 / 开头的同源路径或 http(s) 地址"
 
 command -v node >/dev/null 2>&1 || die "未安装 Node.js（需要 >= 20）"
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 [[ "${NODE_MAJOR}" -ge 20 ]] || die "Node.js 版本过低：$(node -v)，需要 >= 20"
 command -v npm >/dev/null 2>&1 || die "未安装 npm"
 
-echo "构建 vilo-upload（API: ${VITE_API_BASE}）"
+echo "构建 vilo-upload（模板 API: ${VITE_API_BASE}，主体替换 API: ${VITE_REMIX_API_BASE}）"
 cd "${APP_DIR}"
 npm ci --no-audit --no-fund
-VITE_API_BASE="${VITE_API_BASE}" npm run build
+VITE_API_BASE="${VITE_API_BASE}" VITE_REMIX_API_BASE="${VITE_REMIX_API_BASE}" npm run build
 
 echo "发布静态文件到 ${WEB_ROOT}"
 install -d -m 0755 "$(dirname "${WEB_ROOT}")"

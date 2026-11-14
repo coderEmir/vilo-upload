@@ -3,10 +3,13 @@ import { computed, onMounted, ref, toRaw } from 'vue';
 import * as XLSX from 'xlsx';
 import { unzipSync } from 'fflate';
 import { modelMatchesTemplateType, resolveTemplateModel, type Model, type ModelParam, type TemplateType } from './template-models';
+import RemixWorkspace from './RemixWorkspace.vue';
 
 type Episode = { id?: string; number: number; title: string; synopsis: string; storyBeat: unknown; durationSeconds: number | null; minDurationSeconds: number; maxDurationSeconds: number; mediaAssets: unknown[]; referenceAssets: unknown[]; agents: unknown[]; promptTemplate: string; negativePrompt: string | null; defaultParams: Record<string, unknown> | null; premium: boolean; active: boolean; modelCode: string; parameters: Record<string, unknown> };
 type Template = { id: string; slug: string; title: string; type: string; category: string; genreId: string | null; description: string; storyBackground: unknown; coverUrl: string; tags: string[]; audience: string | null; marketScore: number; sourceMeta: unknown; status: string; premium: boolean; active: boolean; sortOrder: number; publishedAt: string | null; episodes: Episode[] };
 const apiBase = (import.meta.env.VITE_API_BASE || '/template-api').replace(/\/$/, '');
+const remixApiBase = (import.meta.env.VITE_REMIX_API_BASE || '/remix-api').replace(/\/$/, '');
+const workspaceMode = ref<'templates' | 'remix'>('templates');
 const adminKey = ref(localStorage.getItem('templateAdminKey') || '');
 const templates = ref<Template[]>([]);
 const activeType = ref<TemplateType>('SHORT_VIDEO');
@@ -435,9 +438,10 @@ onMounted(() => { void load(); });
   <div class="shell">
     <header class="topbar">
       <a class="brand" href="#"><span class="brand-mark">V</span><span>VILO <small>STUDIO</small></span></a>
-      <div class="top-actions"><span class="connection"><i></i> TEMPLATE CATALOG</span><button class="icon-button" title="重新加载" aria-label="重新加载" @click="load">↻</button></div>
+      <nav class="product-tabs" role="tablist" aria-label="内容运营功能"><button role="tab" :aria-selected="workspaceMode === 'templates'" :class="{ active: workspaceMode === 'templates' }" @click="workspaceMode = 'templates'">模板管理</button><button role="tab" :aria-selected="workspaceMode === 'remix'" :class="{ active: workspaceMode === 'remix' }" @click="workspaceMode = 'remix'">主体批量替换</button></nav>
+      <div class="top-actions"><span class="connection"><i></i> {{ workspaceMode === 'templates' ? 'TEMPLATE CATALOG' : 'REMIX QUEUE' }}</span><button v-if="workspaceMode === 'templates'" class="icon-button" title="重新加载" aria-label="重新加载" @click="load">↻</button></div>
     </header>
-    <main>
+    <main v-if="workspaceMode === 'templates'">
       <div class="page-heading"><div><p class="eyebrow">CONTENT OPERATIONS / 01</p><h1>模板管理</h1><p class="subheading">管理创作模板、参考素材与生成模型配置</p></div><button class="primary" @click="createTemplate">＋ 新建模板</button></div>
       <div v-if="error" class="banner error">{{ error }} <button @click="error = ''">关闭</button></div>
       <div v-if="notice" class="banner success">{{ notice }}</div>
@@ -474,6 +478,7 @@ onMounted(() => { void load(); });
         <section v-else class="welcome"><div class="welcome-mark">V</div><h2>模板工作台</h2><p>从模板目录选择一项进行编辑，或创建新模板。</p><button class="primary" @click="createTemplate">＋ 新建模板</button></section>
       </div>
     </main>
-    <footer><span>VILO STUDIO <i></i> CONTENT SYSTEM</span><label>API 管理密钥 <input v-model="adminKey" type="password" autocomplete="off" placeholder="输入管理密钥" @change="saveKey" /></label><span>API {{ apiBase }}</span></footer>
+    <RemixWorkspace v-else :admin-key="adminKey" />
+    <footer><span>VILO STUDIO <i></i> CONTENT SYSTEM</span><label>API 管理密钥 <input v-model="adminKey" type="password" autocomplete="off" placeholder="输入管理密钥" @change="saveKey" /></label><span>API {{ workspaceMode === 'templates' ? apiBase : remixApiBase }}</span></footer>
   </div>
 </template>
