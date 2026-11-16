@@ -4,6 +4,7 @@ set -euo pipefail
 DOMAIN="${DOMAIN:-upload.viloai.fun}"
 WEB_ROOT="${WEB_ROOT:-/var/www/vilo-upload}"
 UPSTREAM="${UPSTREAM:-http://127.0.0.1:3010}"
+REMIX_UPSTREAM="${REMIX_UPSTREAM:-http://127.0.0.1:3020}"
 SITE_AVAILABLE="${SITE_AVAILABLE:-/etc/nginx/sites-available/${DOMAIN}.conf}"
 SITE_ENABLED="${SITE_ENABLED:-/etc/nginx/sites-enabled/${DOMAIN}.conf}"
 CERT_DIR="${CERT_DIR:-/etc/letsencrypt/live/${DOMAIN}}"
@@ -38,6 +39,12 @@ else
   warn "模板服务不可访问：${UPSTREAM}/health（不阻止修复 Nginx）"
 fi
 rm -f /tmp/vilo-template-health.$$
+if curl -fsS --max-time 5 "${REMIX_UPSTREAM}/health" >/tmp/vilo-remix-health.$$ 2>/dev/null; then
+  ok "主体替换服务正常：$(cat /tmp/vilo-remix-health.$$)"
+else
+  warn "主体替换服务不可访问：${REMIX_UPSTREAM}/health（不阻止修复 Nginx）"
+fi
+rm -f /tmp/vilo-remix-health.$$
 
 if getent ahostsv4 "${DOMAIN}" >/dev/null 2>&1; then
   ok "DNS 已解析：$(getent ahostsv4 "${DOMAIN}" | awk 'NR==1 {print $1}')"
@@ -115,6 +122,23 @@ server {
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
+
+    location /remix-api/ {
+        proxy_pass ${REMIX_UPSTREAM}/api/;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    location = /remix-health {
+        proxy_pass ${REMIX_UPSTREAM}/health;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
 }
 EOF
 
@@ -145,6 +169,8 @@ curl -kfsSI --max-time 10 --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}
   || warn "本机 HTTPS 页面验证失败"
 curl -kfsS --max-time 10 --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/template-health" \
   || warn "本机模板健康检查失败"
+curl -kfsS --max-time 10 --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/remix-health" \
+  || warn "本机主体替换健康检查失败"
 printf '\n'
 
 echo "检查完成。只检查：sudo $0；自动修复：sudo $0 --fix"

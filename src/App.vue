@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, toRaw } from 'vue';
 import * as XLSX from 'xlsx';
 import { unzipSync } from 'fflate';
+import { normalizeAdminKey, verifyAdminKey, type AdminKeyStatus } from './admin-auth';
 import { modelMatchesTemplateType, resolveTemplateModel, type Model, type ModelParam, type TemplateType } from './template-models';
 import RemixWorkspace from './RemixWorkspace.vue';
 
@@ -10,7 +11,8 @@ type Template = { id: string; slug: string; title: string; type: string; categor
 const apiBase = (import.meta.env.VITE_API_BASE || '/template-api').replace(/\/$/, '');
 const remixApiBase = (import.meta.env.VITE_REMIX_API_BASE || '/remix-api').replace(/\/$/, '');
 const workspaceMode = ref<'templates' | 'remix'>('templates');
-const adminKey = ref(localStorage.getItem('templateAdminKey') || '');
+const adminKey = ref(normalizeAdminKey(localStorage.getItem('templateAdminKey') || ''));
+const adminKeyStatus = ref<AdminKeyStatus>('idle');
 const templates = ref<Template[]>([]);
 const activeType = ref<TemplateType>('SHORT_VIDEO');
 const isCreating = ref(false);
@@ -430,8 +432,14 @@ async function removeTemplate() {
   catch (e) { error.value = e instanceof Error ? e.message : '删除失败'; }
   finally { loading.value = false; }
 }
-function saveKey() { localStorage.setItem('templateAdminKey', adminKey.value); void load(); }
-onMounted(() => { void load(); });
+async function saveKey() {
+  adminKey.value = normalizeAdminKey(adminKey.value); error.value = ''; notice.value = '';
+  if (!adminKey.value) { localStorage.removeItem('templateAdminKey'); adminKeyStatus.value = 'invalid'; error.value = '请输入 API 管理密钥'; return; }
+  adminKeyStatus.value = 'checking';
+  try { await verifyAdminKey(apiBase, remixApiBase, adminKey.value); localStorage.setItem('templateAdminKey', adminKey.value); adminKeyStatus.value = 'valid'; notice.value = '管理密钥验证成功'; await load(); }
+  catch (e) { adminKeyStatus.value = 'invalid'; localStorage.removeItem('templateAdminKey'); error.value = e instanceof Error ? e.message : '管理密钥验证失败'; }
+}
+onMounted(() => { if (adminKey.value) void saveKey(); });
 </script>
 
 <template>
@@ -479,6 +487,6 @@ onMounted(() => { void load(); });
       </div>
     </main>
     <RemixWorkspace v-else :admin-key="adminKey" />
-    <footer><span>VILO STUDIO <i></i> CONTENT SYSTEM</span><label>API 管理密钥 <input v-model="adminKey" type="password" autocomplete="off" placeholder="输入管理密钥" @change="saveKey" /></label><span>API {{ workspaceMode === 'templates' ? apiBase : remixApiBase }}</span></footer>
+    <footer><span>VILO STUDIO <i></i> CONTENT SYSTEM</span><label>API 管理密钥 <input v-model="adminKey" type="password" autocomplete="off" placeholder="输入管理密钥" @keyup.enter="saveKey" /><button type="button" class="secondary" :disabled="adminKeyStatus === 'checking'" @click="saveKey">{{ adminKeyStatus === 'checking' ? '验证中…' : '验证并保存' }}</button><small v-if="adminKeyStatus === 'valid'">已验证</small></label><span>API {{ workspaceMode === 'templates' ? apiBase : remixApiBase }}</span></footer>
   </div>
 </template>
