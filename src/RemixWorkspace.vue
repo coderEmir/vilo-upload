@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { readApiResponse } from './api-response';
 
 type Param = { key: string; type: string; required: boolean; defaultValue: string | null; options: Array<{ value: string; isDefault: boolean }> };
 type Model = { id: string; code: string; name: string; modality: 'IMAGE' | 'VIDEO'; params: Param[] };
@@ -36,17 +37,15 @@ async function request(path: string, init: RequestInit = {}) {
     ...init,
     headers: { 'Content-Type': 'application/json', 'x-template-admin-key': props.adminKey, ...init.headers },
   });
-  const payload = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(payload?.error?.message || `请求失败 (${response.status})`);
-  return payload;
+  return readApiResponse(response, '请求失败');
 }
 
 async function upload(file: File): Promise<Asset> {
   const response = await fetch(`${apiBase}/template-remix/assets`, {
     method: 'POST', body: file, headers: { 'Content-Type': file.type, 'x-template-admin-key': props.adminKey },
   });
-  const payload = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(payload?.error?.message || `上传 ${file.name} 失败`);
+  const payload = await readApiResponse(response, `上传 ${file.name} 失败`);
+  if (typeof payload.url !== 'string' || typeof payload.mimeType !== 'string') throw new Error('素材上传接口响应缺少有效的 url 或 mimeType');
   return { ...payload, name: file.name };
 }
 
@@ -102,7 +101,9 @@ async function createAndStart() {
 
 async function loadConfig() {
   if (!props.adminKey) return;
-  const data = await request('/template-remix/config'); models.value = data.models;
+  const data = await request('/template-remix/config');
+  if (!Array.isArray(data.models)) throw new Error('主体替换配置接口响应缺少 models 数组，请检查后端服务版本');
+  models.value = data.models;
   imageModelCode.value ||= imageModels.value[0]?.code || '';
   videoModelCode.value ||= videoModels.value[0]?.code || '';
 }
