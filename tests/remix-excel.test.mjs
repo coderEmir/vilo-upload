@@ -33,20 +33,11 @@ test('detects signed video and image link extensions', () => {
   assert.equal(mediaMime('https://example.com/image.JPG#view'), 'image/jpeg');
 });
 
-test('one template collects multiple image and video columns plus additional rows', async () => {
-  const { groupImportSources } = await import('../src/remix-excel.ts');
-  const rows = await readRemixExcel(excel([
-    ['模板标识', '模板名称', '图片1', '图片2', '视频1', '视频2', '主体图片'],
-    ['group-1', '完整模板', 'https://example.com/1.jpg\nhttps://example.com/2.jpg', 'https://example.com/3.png', 'https://example.com/1.mp4', 'https://example.com/2.mp4', 'https://example.com/person.png'],
-    ['group-1', '完整模板', 'https://example.com/4.jpg', '', '', '', 'https://example.com/person.png'],
-    ['group-2', '另一个模板', 'https://example.com/5.jpg', '', '', '', ''],
-  ]));
-  const groups = groupImportSources(rows);
-  assert.equal(groups.length, 2);
-  assert.equal(groups[0].assets.length, 6);
-  assert.equal(groups[0].assets.filter((asset) => asset.mimeType.startsWith('video/')).length, 2);
-  assert.ok(groups[0].assets.every((asset) => asset.subjectUrl === 'https://example.com/person.png'));
-  assert.equal(groups[1].assets.length, 1);
+test('rejects multiple sources sharing one Excel row', async () => {
+  await assert.rejects(readRemixExcel(excel([
+    ['模板标识', '图片1', '视频1', '主体图片'],
+    ['group', 'https://example.com/a.png', 'https://example.com/b.mp4', 'https://example.com/person.png'],
+  ])), /每行只允许一条/);
 });
 
 test('different names cannot accidentally share the same template identifier', async () => {
@@ -58,14 +49,54 @@ test('different names cannot accidentally share the same template identifier', a
 });
 
 
-test('the first subject becomes the template default for additional media rows', async () => {
+test('subjects remain independent and never become a template default', async () => {
   const { groupImportSources } = await import('../src/remix-excel.ts');
   const groups = groupImportSources(await readRemixExcel(excel([
     ['模板标识', '原素材', '主体图片'],
     ['template', 'https://example.com/a.png', 'https://example.com/person.png'],
     ['template', 'https://example.com/b.mp4', ''],
   ])));
-  assert.equal(groups[0].subjectUrl, 'https://example.com/person.png');
+  assert.equal(groups[0].assets[0].subjectUrl, 'https://example.com/person.png');
+  assert.equal('subjectUrl' in groups[0], false);
   assert.equal(groups[0].assets[1].subjectUrl, undefined);
   assert.equal(groups[0].assets.length, 2);
+});
+
+
+test('template prompt survives mixed-media Excel grouping and conflicts are rejected', async () => {
+  const { groupImportSources } = await import('../src/remix-excel.ts');
+  const sources = await readRemixExcel(excel([
+    ['模板标识', '原素材', '模板提示词', '替换要求'],
+    ['same', 'https://example.com/a.png', '模板生成提示词', '保留背景'],
+    ['same', 'https://example.com/b.mp4', '', '保留背景'],
+  ]));
+  const groups = groupImportSources(sources);
+  assert.equal(groups[0].templatePrompt, '模板生成提示词');
+  assert.equal(groups[0].assets.length, 2);
+  assert.equal(groups[0].assets[1].prompt, '保留背景');
+  assert.throws(() => groupImportSources([...sources, { ...sources[0], templatePrompt: '冲突' }]), /不同的模板提示词/);
+});
+
+test('infers link media from the path suffix regardless of case or signed query', () => {
+  assert.equal(mediaMime('https://cdn.example.com/clip.MP4?filename=cover.jpg#preview'), 'video/mp4');
+  assert.equal(mediaMime('https://cdn.example.com/photo.PNG?next=clip.mp4'), 'image/png');
+  assert.equal(mediaMime('https://cdn.example.com/clip%2Emp4?signature=abc'), 'video/mp4');
+  assert.equal(mediaMime('https://cdn.example.com/stream?filename=clip.mp4'), '');
+});
+
+test('Excel display assets group into independent template-level slots', async () => {
+  const { groupImportSources } = await import('../src/remix-excel.ts');
+  const groups = groupImportSources(await readRemixExcel(excel([
+    ['模板标识', '原素材', '主体图片', '指定封面', '封面主体图片', '指定预览', '预览主体图片'],
+    ['same', 'https://example.com/input.png', '', 'https://example.com/cover.gif', 'https://example.com/cover-person.png', 'https://example.com/preview.mp4', 'https://example.com/video-person.png'],
+    ['same', 'https://example.com/input2.mp4', '', '', '', '', ''],
+  ])));
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].assets.length, 2);
+  assert.equal(groups[0].assets[0].subjectUrl, undefined);
+  assert.equal(groups[0].cover.url, 'https://example.com/cover.gif');
+  assert.equal(groups[0].cover.subjectUrl, 'https://example.com/cover-person.png');
+  assert.equal(groups[0].preview.subjectUrl, 'https://example.com/video-person.png');
+  assert.throws(() => groupImportSources([{ ...groups[0].cover, templateKey: 'same' }, { ...groups[0].cover, templateKey: 'same' }]), /只能指定一个封面/);
+  await assert.rejects(readRemixExcel(excel([['原素材', '指定预览'], ['https://example.com/in.jpg', 'https://example.com/static.png']])), /预览必须是视频或动态图/);
 });

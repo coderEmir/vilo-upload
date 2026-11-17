@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, toRaw } from 'vue';
+import { computed, onMounted, ref, toRaw, watch } from 'vue';
 import * as XLSX from 'xlsx';
 import { unzipSync } from 'fflate';
 import { normalizeAdminKey, verifyAdminKey, type AdminKeyStatus } from './admin-auth';
@@ -11,7 +11,12 @@ type Template = { id: string; slug: string; title: string; type: string; categor
 const apiBase = (import.meta.env.VITE_API_BASE || '/template-api').replace(/\/$/, '');
 const remixApiBase = (import.meta.env.VITE_REMIX_API_BASE || '/remix-api').replace(/\/$/, '');
 const workspaceMode = ref<'templates' | 'remix'>('templates');
-const adminKey = ref(normalizeAdminKey(localStorage.getItem('templateAdminKey') || ''));
+const keyCacheError = ref('');
+function readCachedKey() {
+  try { return normalizeAdminKey(localStorage.getItem('templateAdminKey') || ''); }
+  catch { keyCacheError.value = '浏览器未允许缓存密钥'; return ''; }
+}
+const adminKey = ref(readCachedKey());
 const adminKeyStatus = ref<AdminKeyStatus>('idle');
 const templates = ref<Template[]>([]);
 const activeType = ref<TemplateType>('SHORT_VIDEO');
@@ -432,12 +437,28 @@ async function removeTemplate() {
   catch (e) { error.value = e instanceof Error ? e.message : '删除失败'; }
   finally { loading.value = false; }
 }
+watch(adminKey, (value) => {
+  adminKeyStatus.value = 'idle';
+  try {
+    const key = normalizeAdminKey(value);
+    if (key) localStorage.setItem('templateAdminKey', key);
+    else localStorage.removeItem('templateAdminKey');
+    keyCacheError.value = '';
+  } catch { keyCacheError.value = '浏览器未允许缓存密钥'; }
+}, { flush: 'sync' });
 async function saveKey() {
   adminKey.value = normalizeAdminKey(adminKey.value); error.value = ''; notice.value = '';
-  if (!adminKey.value) { localStorage.removeItem('templateAdminKey'); adminKeyStatus.value = 'invalid'; error.value = '请输入 API 管理密钥'; return; }
+  const key = adminKey.value;
+  if (!key) { adminKeyStatus.value = 'invalid'; error.value = '请输入 API 管理密钥'; return; }
   adminKeyStatus.value = 'checking';
-  try { await verifyAdminKey(apiBase, remixApiBase, adminKey.value); localStorage.setItem('templateAdminKey', adminKey.value); adminKeyStatus.value = 'valid'; notice.value = '管理密钥验证成功'; await load(); }
-  catch (e) { adminKeyStatus.value = 'invalid'; localStorage.removeItem('templateAdminKey'); error.value = e instanceof Error ? e.message : '管理密钥验证失败'; }
+  try {
+    await verifyAdminKey(apiBase, remixApiBase, key);
+    if (adminKey.value !== key) return;
+    adminKeyStatus.value = 'valid'; notice.value = '管理密钥验证成功'; await load();
+  } catch (e) {
+    if (adminKey.value !== key) return;
+    adminKeyStatus.value = 'invalid'; error.value = e instanceof Error ? e.message : '管理密钥验证失败';
+  }
 }
 onMounted(() => { if (adminKey.value) void saveKey(); });
 </script>
@@ -447,7 +468,7 @@ onMounted(() => { if (adminKey.value) void saveKey(); });
     <header class="topbar">
       <a class="brand" href="#"><span class="brand-mark">V</span><span>VILO <small>STUDIO</small></span></a>
       <nav class="product-tabs" role="tablist" aria-label="内容运营功能"><button role="tab" :aria-selected="workspaceMode === 'templates'" :class="{ active: workspaceMode === 'templates' }" @click="workspaceMode = 'templates'">模板管理</button><button role="tab" :aria-selected="workspaceMode === 'remix'" :class="{ active: workspaceMode === 'remix' }" @click="workspaceMode = 'remix'">主体批量替换</button></nav>
-      <div class="top-actions"><span class="connection"><i></i> {{ workspaceMode === 'templates' ? 'TEMPLATE CATALOG' : 'REMIX QUEUE' }}</span><button v-if="workspaceMode === 'templates'" class="icon-button" title="重新加载" aria-label="重新加载" @click="load">↻</button></div>
+      <div class="top-actions"><span class="connection"><i></i> {{ workspaceMode === 'templates' ? 'TEMPLATE CATALOG' : 'REMIX QUEUE' }}</span><button v-if="workspaceMode === 'templates'" class="secondary" :disabled="loading" @click="load">{{ loading ? '刷新中…' : '刷新模板状态' }}</button></div>
     </header>
     <main v-if="workspaceMode === 'templates'">
       <div class="page-heading"><div><p class="eyebrow">CONTENT OPERATIONS / 01</p><h1>模板管理</h1><p class="subheading">管理创作模板、参考素材与生成模型配置</p></div><button class="primary" @click="createTemplate">＋ 新建模板</button></div>
@@ -487,6 +508,6 @@ onMounted(() => { if (adminKey.value) void saveKey(); });
       </div>
     </main>
     <RemixWorkspace v-else :admin-key="adminKey" />
-    <footer><span>VILO STUDIO <i></i> CONTENT SYSTEM</span><label>API 管理密钥 <input v-model="adminKey" type="password" autocomplete="off" placeholder="输入管理密钥" @keyup.enter="saveKey" /><button type="button" class="secondary" :disabled="adminKeyStatus === 'checking'" @click="saveKey">{{ adminKeyStatus === 'checking' ? '验证中…' : '验证并保存' }}</button><small v-if="adminKeyStatus === 'valid'">已验证</small></label><span>API {{ workspaceMode === 'templates' ? apiBase : remixApiBase }}</span></footer>
+    <footer><span>VILO STUDIO <i></i> CONTENT SYSTEM</span><label>API 管理密钥 <input v-model="adminKey" type="password" autocomplete="off" placeholder="输入管理密钥" @keyup.enter="saveKey" /><button type="button" class="secondary" :disabled="adminKeyStatus === 'checking'" @click="saveKey">{{ adminKeyStatus === 'checking' ? '验证中…' : '验证并保存' }}</button><small>{{ keyCacheError || (adminKey ? (adminKeyStatus === 'valid' ? '已缓存 · 已验证' : '已缓存到本浏览器') : '清空输入将清除缓存') }}</small></label><span>API {{ workspaceMode === 'templates' ? apiBase : remixApiBase }}</span></footer>
   </div>
 </template>

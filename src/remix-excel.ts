@@ -1,9 +1,12 @@
 import * as XLSX from 'xlsx';
 import { unzipSync } from 'fflate';
 
-export type ImportSource = { keepOriginal?: boolean; templateKey?: string; name: string; file?: File; url?: string; mimeType: string; subjectFile?: File; subjectUrl?: string; title?: string; prompt?: string };
+export type ImportSource = { assetRole?: 'INPUT' | 'COVER' | 'PREVIEW'; keepOriginal?: boolean; templateKey?: string; name: string; file?: File; url?: string; mimeType: string; subjectFile?: File; subjectUrl?: string; title?: string; templatePrompt?: string; prompt?: string };
 export function mediaMime(name: string): string {
-  const ext = name.split(/[?#]/)[0]?.split('.').pop()?.toLowerCase();
+  let path = name.split(/[?#]/)[0] || '';
+  try { path = new URL(name).pathname; } catch { /* 本地文件名直接读取后缀 */ }
+  try { path = decodeURIComponent(path); } catch { /* 保留无法解码的文件名 */ }
+  const ext = path.split('/').pop()?.split('.').pop()?.toLowerCase();
   return ({ jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm' } as Record<string, string>)[ext || ''] || '';
 }
 function xml(bytes?: Uint8Array): Document | undefined { return bytes ? new DOMParser().parseFromString(new TextDecoder().decode(bytes), 'application/xml') : undefined; }
@@ -94,10 +97,33 @@ export async function readRemixExcel(file: File): Promise<ImportSource[]> {
           const mimeType = source.file?.type || mediaMime(sourceUrl) || (/视频|video/i.test(hint) ? 'video/mp4' : 'image/jpeg');
           found++;
           results.push({ templateKey, name: `${sheetName}-${row + 1}-${sourceCol + 1}-${found}`, file: source.file, url: source.file ? undefined : sourceUrl, mimeType,
-            subjectFile: subject?.file, subjectUrl: subject?.file ? undefined : subjectUrl || undefined, title, prompt: cellText(row, headers.indexOf('替换要求')) });
+            subjectFile: subject?.file, subjectUrl: subject?.file ? undefined : subjectUrl || undefined, title, templatePrompt: cellText(row, headers.indexOf('模板提示词')), prompt: cellText(row, headers.indexOf('替换要求')) });
         }
       }
-      if (!found) throw new Error(`${sheetName} 第 ${row + 1} 行：没有图片或视频原素材`);
+      for (const [assetRole, column, subjectColumn] of [['COVER', '指定封面', '封面主体图片'], ['PREVIEW', '指定预览', '预览主体图片']] as const) {
+        const col = headers.indexOf(column);
+        const subjectIndex = headers.indexOf(subjectColumn);
+        const values = [...(embedded.get(`${row}:${col}`) ?? []), ...(cellText(row, col) ? [{ url: cellText(row, col) }] : [])];
+        if (values.length > 1) throw new Error(`${sheetName} 第 ${row + 1} 行：${column}只能指定一条素材`);
+        const display = values[0];
+        const subjectValues = [...(embedded.get(`${row}:${subjectIndex}`) ?? []), ...(cellText(row, subjectIndex) ? [{ url: cellText(row, subjectIndex) }] : [])];
+        if (subjectValues.length > 1) throw new Error(`${sheetName} 第 ${row + 1} 行：${subjectColumn}只能指定一张图片`);
+        const displaySubject = subjectValues[0];
+        if (!display) {
+          if (displaySubject) throw new Error(`${sheetName} 第 ${row + 1} 行：配置${subjectColumn}前请先配置${column}`);
+          continue;
+        }
+        if (display.url && !/^https?:\/\//i.test(display.url)) throw new Error(`${column}链接无效`);
+        if (displaySubject?.url && !/^https?:\/\//i.test(displaySubject.url)) throw new Error(`${subjectColumn}链接无效`);
+        if (displaySubject?.file && !displaySubject.file.type.startsWith('image/')) throw new Error(`${subjectColumn}必须是图片`);
+        const mimeType = display.file?.type || mediaMime(display.url || '') || (assetRole === 'COVER' ? 'image/jpeg' : 'video/mp4');
+        if (assetRole === 'COVER' && !mimeType.startsWith('image/')) throw new Error('指定封面必须是静态图或动态图');
+        if (assetRole === 'PREVIEW' && !mimeType.startsWith('video/') && !['image/gif', 'image/webp'].includes(mimeType)) throw new Error('指定预览必须是视频或动态图');
+        results.push({ assetRole, templateKey, title, name: `${sheetName}-${row + 1}-${column}`, mimeType, file: display.file, url: display.url,
+          subjectFile: displaySubject?.file, subjectUrl: displaySubject?.url });
+      }
+      if (found > 1) throw new Error(`${sheetName} 第 ${row + 1} 行：每行只允许一条图片或视频原素材，对应一个主体；同模板请分多行填写`);
+      if (!found && !results.some(source => source.name.startsWith(`${sheetName}-${row + 1}-`) && source.assetRole)) throw new Error(`${sheetName} 第 ${row + 1} 行：没有图片或视频原素材`);
     }
   }
   if (!results.length) throw new Error('Excel 中没有可导入的素材');
@@ -105,7 +131,7 @@ export async function readRemixExcel(file: File): Promise<ImportSource[]> {
   return results;
 }
 
-export type ImportTemplate = { key: string; title: string; assets: ImportSource[]; subjectFile?: File; subjectUrl?: string };
+export type ImportTemplate = { cover?: ImportSource; preview?: ImportSource; key: string; title: string; templatePrompt?: string; assets: ImportSource[] };
 export function groupImportSources(sources: ImportSource[]): ImportTemplate[] {
   const groups = new Map<string, ImportTemplate>();
   for (const [index, source] of sources.entries()) {
@@ -114,10 +140,15 @@ export function groupImportSources(sources: ImportSource[]): ImportTemplate[] {
     if (!group) { group = { key, title: source.title || key, assets: [] }; groups.set(key, group); }
     if (source.title && group.title !== key && group.title !== source.title) throw new Error(`模板标识“${key}”对应了不同的模板名称`);
     if (source.title) group.title = source.title;
-    if (!group.subjectFile && !group.subjectUrl && (source.subjectFile || source.subjectUrl)) {
-      group.subjectFile = source.subjectFile; group.subjectUrl = source.subjectUrl;
+    if (source.templatePrompt) {
+      if (group.templatePrompt && group.templatePrompt !== source.templatePrompt) throw new Error(`模板标识“${key}”对应了不同的模板提示词`);
+      group.templatePrompt = source.templatePrompt;
     }
-    group.assets.push(source);
+    if (source.assetRole === 'COVER' || source.assetRole === 'PREVIEW') {
+      const field = source.assetRole === 'COVER' ? 'cover' : 'preview';
+      if (group[field]) throw new Error(`模板“${key}”只能指定一个${field === 'cover' ? '封面' : '预览'}`);
+      group[field] = source;
+    } else group.assets.push(source);
   }
   return [...groups.values()];
 }
