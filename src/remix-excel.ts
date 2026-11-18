@@ -1,7 +1,11 @@
 import * as XLSX from 'xlsx';
 import { unzipSync } from 'fflate';
 
-export type ImportSource = { assetRole?: 'INPUT' | 'COVER' | 'PREVIEW'; keepOriginal?: boolean; templateKey?: string; name: string; file?: File; url?: string; mimeType: string; subjectFile?: File; subjectUrl?: string; title?: string; templatePrompt?: string; prompt?: string };
+export type ImportSubject = { subjectName: string; file?: File; url?: string };
+export function subjectsForImport(source: ImportSource): ImportSubject[] {
+  return source.subjects ?? (source.subjectFile || source.subjectUrl ? [{ subjectName: source.subjectName || "主体1", file: source.subjectFile, url: source.subjectUrl }] : []);
+}
+export type ImportSource = { subjects?: ImportSubject[]; subjectName?: string; assetRole?: 'INPUT' | 'COVER' | 'PREVIEW'; keepOriginal?: boolean; templateKey?: string; name: string; file?: File; url?: string; mimeType: string; subjectFile?: File; subjectUrl?: string; title?: string; templatePrompt?: string; prompt?: string };
 export function mediaMime(name: string): string {
   let path = name.split(/[?#]/)[0] || '';
   try { path = new URL(name).pathname; } catch { /* 本地文件名直接读取后缀 */ }
@@ -78,12 +82,27 @@ export async function readRemixExcel(file: File): Promise<ImportSource[]> {
       const cellsHaveContent = (rows[row] || []).some((value) => String(value).trim());
       const hasEmbedded = sourceCols.some((col) => embedded.has(`${row}:${col}`));
       if (!cellsHaveContent && !hasEmbedded) continue;
-      const subjects = embedded.get(`${row}:${subjectCol}`) ?? [];
-      if (subjects.length > 1) throw new Error(`${sheetName} 第 ${row + 1} 行：主体图片单元格只允许一张图片`);
-      const subject = subjects[0];
-      const subjectUrl = subject?.url || cellText(row, subjectCol);
-      if (subjectUrl && !/^https?:\/\//i.test(subjectUrl)) throw new Error(`${sheetName} 第 ${row + 1} 行：主体链接无效`);
-      if (subject?.file && !subject.file.type.startsWith('image/')) throw new Error(`${sheetName} 第 ${row + 1} 行：主体必须是图片`);
+      const readSubjects = (prefix: string): ImportSubject[] => {
+        const subjects: ImportSubject[] = [];
+        for (let index = 1; index <= 4; index++) {
+          const suffix = index === 1 ? '' : String(index);
+          const column = prefix ? headers.indexOf(`${prefix}主体图片${suffix}`) : index === 1 ? subjectCol : headers.indexOf(`主体图片${suffix}`);
+          const values = embedded.get(`${row}:${column}`) ?? [];
+          if (values.length > 1) throw new Error(`${sheetName} 第 ${row + 1} 行：每个主体只允许一张参考图片`);
+          const value = values[0];
+          const url = value?.url || cellText(row, column);
+          const subjectName = cellText(row, headers.indexOf(`${prefix}主体名称${suffix}`));
+          if (!value?.file && !url) {
+            if (subjectName) throw new Error(`主体“${subjectName}”缺少图片`);
+            continue;
+          }
+          if (url && !/^https?:\/\//i.test(url)) throw new Error('主体链接无效');
+          if (value?.file && !value.file.type.startsWith('image/')) throw new Error('主体必须是图片');
+          subjects.push({ subjectName: subjectName || `主体${index}`, file: value?.file, url: value?.file ? undefined : url });
+        }
+        return subjects;
+      };
+      const subjects = readSubjects('');
       const title = cellText(row, headers.indexOf('模板名称'));
       const templateKey = cellText(row, headers.findIndex((v) => /^(模板标识|模板唯一标识|templateKey)$/i.test(v.trim()))) || `${sheetName}-${row + 1}`;
       let found = 0;
@@ -97,32 +116,27 @@ export async function readRemixExcel(file: File): Promise<ImportSource[]> {
           const mimeType = source.file?.type || mediaMime(sourceUrl) || (/视频|video/i.test(hint) ? 'video/mp4' : 'image/jpeg');
           found++;
           results.push({ templateKey, name: `${sheetName}-${row + 1}-${sourceCol + 1}-${found}`, file: source.file, url: source.file ? undefined : sourceUrl, mimeType,
-            subjectFile: subject?.file, subjectUrl: subject?.file ? undefined : subjectUrl || undefined, title, templatePrompt: cellText(row, headers.indexOf('模板提示词')), prompt: cellText(row, headers.indexOf('替换要求')) });
+            subjects: subjects.map(subject => ({ ...subject })), title, templatePrompt: cellText(row, headers.indexOf('模板提示词')), prompt: cellText(row, headers.indexOf('替换要求')) });
         }
       }
       for (const [assetRole, column, subjectColumn] of [['COVER', '指定封面', '封面主体图片'], ['PREVIEW', '指定预览', '预览主体图片']] as const) {
         const col = headers.indexOf(column);
-        const subjectIndex = headers.indexOf(subjectColumn);
         const values = [...(embedded.get(`${row}:${col}`) ?? []), ...(cellText(row, col) ? [{ url: cellText(row, col) }] : [])];
         if (values.length > 1) throw new Error(`${sheetName} 第 ${row + 1} 行：${column}只能指定一条素材`);
         const display = values[0];
-        const subjectValues = [...(embedded.get(`${row}:${subjectIndex}`) ?? []), ...(cellText(row, subjectIndex) ? [{ url: cellText(row, subjectIndex) }] : [])];
-        if (subjectValues.length > 1) throw new Error(`${sheetName} 第 ${row + 1} 行：${subjectColumn}只能指定一张图片`);
-        const displaySubject = subjectValues[0];
+        const displaySubjects = readSubjects(assetRole === 'COVER' ? '封面' : '预览');
         if (!display) {
-          if (displaySubject) throw new Error(`${sheetName} 第 ${row + 1} 行：配置${subjectColumn}前请先配置${column}`);
+          if (displaySubjects.length) throw new Error(`${sheetName} 第 ${row + 1} 行：配置${subjectColumn}前请先配置${column}`);
           continue;
         }
         if (display.url && !/^https?:\/\//i.test(display.url)) throw new Error(`${column}链接无效`);
-        if (displaySubject?.url && !/^https?:\/\//i.test(displaySubject.url)) throw new Error(`${subjectColumn}链接无效`);
-        if (displaySubject?.file && !displaySubject.file.type.startsWith('image/')) throw new Error(`${subjectColumn}必须是图片`);
         const mimeType = display.file?.type || mediaMime(display.url || '') || (assetRole === 'COVER' ? 'image/jpeg' : 'video/mp4');
         if (assetRole === 'COVER' && !mimeType.startsWith('image/')) throw new Error('指定封面必须是静态图或动态图');
         if (assetRole === 'PREVIEW' && !mimeType.startsWith('video/') && !['image/gif', 'image/webp'].includes(mimeType)) throw new Error('指定预览必须是视频或动态图');
         results.push({ assetRole, templateKey, title, name: `${sheetName}-${row + 1}-${column}`, mimeType, file: display.file, url: display.url,
-          subjectFile: displaySubject?.file, subjectUrl: displaySubject?.url });
+          subjects: displaySubjects });
       }
-      if (found > 1) throw new Error(`${sheetName} 第 ${row + 1} 行：每行只允许一条图片或视频原素材，对应一个主体；同模板请分多行填写`);
+      if (found > 1) throw new Error(`${sheetName} 第 ${row + 1} 行：每行只允许一条图片或视频原素材，对应一个主体组；同模板请分多行填写`);
       if (!found && !results.some(source => source.name.startsWith(`${sheetName}-${row + 1}-`) && source.assetRole)) throw new Error(`${sheetName} 第 ${row + 1} 行：没有图片或视频原素材`);
     }
   }

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import * as XLSX from 'xlsx';
-import { readRemixExcel, groupImportSources, mediaMime, type ImportSource, type ImportTemplate } from './remix-excel';
+import { readRemixExcel, groupImportSources, mediaMime, subjectsForImport, type ImportSource, type ImportTemplate } from './remix-excel';
 import RemixAssetInputs from './RemixAssetInputs.vue';
 import { readApiResponse } from './api-response';
 
@@ -9,7 +9,7 @@ type Param = { label?: string; key: string; type: string; required: boolean; def
 type Model = { id: string; code: string; name: string; modality: 'IMAGE' | 'VIDEO'; params: Param[] };
 type Asset = { url: string; mimeType: string; name?: string; sizeBytes?: number };
 type Attempt = { id: string; status: string; resultAsset?: Asset & { provider?: string }; providerError?: { code?: string; message?: string }; sequence: number };
-type Item = { id: string; sourceKey: string; templateDraft: { slug: string; title: string }; mediaType: 'IMAGE' | 'VIDEO'; sourceAsset: Asset & { subjectAssets?: Asset[]; assetOrder?: number; assetRole?: 'INPUT' | 'COVER' | 'PREVIEW' }; status: string; selected: boolean; uploadedTemplateId?: string; currentAttemptId?: string; currentAttempt?: Attempt };
+type Item = { id: string; sourceKey: string; templateDraft: { slug: string; title: string }; mediaType: 'IMAGE' | 'VIDEO'; sourceAsset: Asset & { subjectAssets?: (Asset & { subjectName?: string })[]; assetOrder?: number; assetRole?: 'INPUT' | 'COVER' | 'PREVIEW' }; status: string; selected: boolean; uploadedTemplateId?: string; currentAttemptId?: string; currentAttempt?: Attempt };
 type Batch = { id: string; name: string; status: string; itemCount: number; counts?: Record<string, number>; items?: Item[]; createdAt: string };
 
 const props = defineProps<{ adminKey: string; templateType: 'IMAGE_GENERATION' | 'SHORT_VIDEO' }>();
@@ -99,8 +99,13 @@ async function createAndStart() {
   for (const group of templates.value) {
     for (const [index, source] of [...group.assets, ...(group.cover ? [group.cover] : []), ...(group.preview ? [group.preview] : [])].entries()) {
       if (!source.file && !source.url?.trim()) { error.value = `${group.title} 第 ${index + 1} 行：请上传原素材或填写原素材链接`; return; }
+      const subjects = subjectsForImport(source);
+      const names = subjects.map(subject => subject.subjectName.trim());
+      if (subjects.length > 4 || new Set(names).size !== names.length || names.some(name => !/^[\p{L}\p{N}_-]{1,80}$/u.test(name)) || subjects.some(subject => !subject.file && !subject.url)) {
+        error.value = `${group.title} 第 ${index + 1} 行：主体组最多 4 个，每个主体须有图片及唯一名称（文字、数字、下划线或短横线）`; return;
+      }
       if (!source.file && source.url) source.mimeType = mediaMime(source.url) || source.mimeType;
-      for (const url of [source.file ? undefined : source.url, source.subjectFile ? undefined : source.subjectUrl]) {
+      for (const url of [source.file ? undefined : source.url, ...subjectsForImport(source).map(subject => subject.file ? undefined : subject.url)]) {
         if (url && !/^https?:\/\/[^\s]+$/i.test(url)) { error.value = `${group.title} 第 ${index + 1} 行：请填写单个 HTTP(S) 链接`; return; }
         if (url) { try { new URL(url); } catch { error.value = `${group.title} 第 ${index + 1} 行：链接格式无效`; return; } }
       }
@@ -129,12 +134,14 @@ async function createAndStart() {
       const entries = [...group.assets.map(source => ({ source, assetRole: 'INPUT' as const })), ...(group.cover ? [{ source: group.cover, assetRole: 'COVER' as const }] : []), ...(group.preview ? [{ source: group.preview, assetRole: 'PREVIEW' as const }] : [])];
       for (const [assetIndex, { source, assetRole }] of entries.entries()) {
         const asset = source.file ? await uploadOnce(source.file) : { url: source.url, mimeType: source.mimeType, name: source.name };
-        const subjectFile = source.keepOriginal ? undefined : source.subjectFile;
-        const subjectUrl = source.keepOriginal ? undefined : source.subjectUrl;
-        const subject = subjectFile ? await uploadOnce(subjectFile) : subjectUrl ? { url: subjectUrl, mimeType: mediaMime(subjectUrl) || 'image/jpeg' } : null;
+        const subjectAssets = [];
+        for (const subject of source.keepOriginal ? [] : subjectsForImport(source)) {
+          const reference = subject.file ? await uploadOnce(subject.file) : { url: subject.url, mimeType: mediaMime(subject.url || '') || 'image/jpeg' };
+          subjectAssets.push({ ...reference, subjectName: subject.subjectName.trim() });
+        }
         items.push({ sourceKey: `${groupIndex + 1}-${assetIndex + 1}-${assetRole}`, assetRole,
           mediaType: source.mimeType.startsWith('video/') ? 'VIDEO' : 'IMAGE', sourceAsset: asset,
-          subjectAssets: subject ? [subject] : [], promptAddition: source.prompt || '', templateDraft,
+          subjectAssets, promptAddition: source.prompt || '', templateDraft,
         });
       }
     }
@@ -244,7 +251,7 @@ async function importExcel(event: Event) {
 function downloadExcel() {
   const workbook = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([
-    ['模板标识', '模板名称', '媒体类型', '原素材', '主体图片', '替换要求', '模板提示词', '指定封面', '封面主体图片', '指定预览', '预览主体图片'],
+    ['模板标识', '模板名称', '媒体类型', '原素材', '主体图片', '替换要求', '模板提示词', '指定封面', '封面主体图片', '指定预览', '预览主体图片', ...['', '封面', '预览'].flatMap(prefix => Array.from({ length: 4 }, (_, i) => i === 0 ? [`${prefix}主体名称`] : [`${prefix}主体图片${i + 1}`, `${prefix}主体名称${i + 1}`]).flat())],
     ['template-1', '多素材示例', '图片', 'https://example.com/1.jpg', 'https://example.com/person1.png', '', '根据用户输入生成同风格内容', 'https://example.com/cover.gif', '', 'https://example.com/preview.mp4', ''],
     ['template-1', '多素材示例', '视频', 'https://example.com/1.mp4', 'https://example.com/person2.png', '', ''],
   ]), '素材');
@@ -266,13 +273,13 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
       <strong>Excel 批量导入</strong>
       <button type="button" class="secondary" @click="downloadExcel">下载 Excel 示例</button>
       <label>导入 Excel<input type="file" accept=".xlsx,.xls" :disabled="uploading" @change="importExcel" /></label>
-      <small>导入为{{ mediaLabel }}模板；每个模板均支持多张图片、多个视频和提示词，相同“模板标识”会合并；每行只填一条原素材及其对应主体。</small>
+      <small>导入为{{ mediaLabel }}模板；每个模板均支持多张图片、多个视频和提示词，相同“模板标识”会合并；每行只填一条原素材及其对应主体组。</small>
     </section>
     <div class="page-heading"><div><p class="eyebrow">内容运营 / 02</p><h1>模板主体批量替换</h1><p class="subheading">{{ mediaLabel }}模板：支持图片、提示词和视频，逐素材替换，整组入库</p></div><button class="secondary" :disabled="loading || uploading || refreshing" @click="refresh(true)">{{ refreshing ? '刷新中…' : '刷新替换 / 入库状态' }}</button></div>
     <div v-if="error" class="banner error" role="alert">{{ error }} <button aria-label="关闭错误" @click="error = ''">关闭</button></div>
     <div v-if="notice" class="banner success" role="status">{{ notice }}</div>
     <section class="remix-setup" aria-labelledby="batch-setup-title">
-      <div class="section-title"><div><h3 id="batch-setup-title">新建替换批次</h3><p>每张图片、每个视频独立配置一个主体；无主体时保留原素材。普通素材和提示词仅作生成入参；指定封面和预览可分别配置主体。处理后人工筛选，再选择模型入库。</p></div><button type="button" class="primary" :disabled="uploading" @click="addTemplate">＋ 新增模板</button></div>
+      <div class="section-title"><div><h3 id="batch-setup-title">新建替换批次</h3><p>每张图片、每个视频独立配置主体组（最多 4 个命名主体），用 @名称 在替换要求中定位；无主体时保留原素材。普通素材和提示词仅作生成入参；指定封面和预览可分别配置主体。处理后人工筛选，再选择模型入库。</p></div><button type="button" class="primary" :disabled="uploading" @click="addTemplate">＋ 新增模板</button></div>
       <div class="remix-form-grid">
         <fieldset v-for="(group, index) in templates" :key="group.key" class="span-2 remix-template-form" :disabled="uploading">
           <legend>模板 {{ index + 1 }} · {{ group.assets.length }} 条素材</legend>
@@ -330,7 +337,7 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
             <div class="candidate-grid">
             <article v-for="item in section.items" :key="item.id" class="candidate-card" :class="{ checked: item.selected }">
               <div class="candidate-media"><video v-if="item.mediaType === 'VIDEO'" :src="item.currentAttempt?.resultAsset?.url || item.sourceAsset.url" controls preload="metadata" /><img v-else :src="item.currentAttempt?.resultAsset?.url || item.sourceAsset.url" :alt="item.sourceKey" loading="lazy" /></div>
-              <div class="candidate-copy"><span>{{ item.sourceKey }} · {{ item.sourceAsset.assetRole === 'COVER' ? '指定封面' : item.sourceAsset.assetRole === 'PREVIEW' ? '指定预览' : '生成入参' }}</span><small>{{ hasSubject(item) ? '主体替换' : '保留原素材' }}</small><span class="state-pill" :data-state="item.status">{{ item.status }}</span></div>
+              <div class="candidate-copy"><span>{{ item.sourceKey }} · {{ item.sourceAsset.assetRole === 'COVER' ? '指定封面' : item.sourceAsset.assetRole === 'PREVIEW' ? '指定预览' : '生成入参' }}</span><small>{{ hasSubject(item) ? '主体替换：' + (item.sourceAsset.subjectAssets || []).map((subject, index) => '@' + (subject.subjectName || `主体${index + 1}`)).join('、') : '保留原素材' }}</small><span class="state-pill" :data-state="item.status">{{ item.status }}</span></div>
               <p v-if="item.currentAttempt?.providerError" class="item-error">{{ item.currentAttempt.providerError.code }} · {{ item.currentAttempt.providerError.message }}</p>
               <div class="candidate-actions"><small>{{ item.mediaType }} · 第 {{ item.currentAttempt?.sequence || 0 }} 次</small><button class="secondary" :disabled="loading || !hasSubject(item) || ['UPLOADED', 'QUEUED', 'RUNNING', 'UPLOADING'].includes(item.status)" @click="regenerate(item)">重新生成此素材</button></div>
             </article>
