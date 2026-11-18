@@ -333,30 +333,38 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
         <div v-if="activeBatch" class="candidate-head"><div><h2>{{ activeBatch.name }}</h2><p>{{ activeBatch.status }} · {{ candidateGroups.length }} 个模板 · {{ activeBatch.itemCount }} 条素材</p></div><button class="primary" :disabled="!selectedGroups.length || loading" @click="uploadSelected">整组入库（{{ selectedGroups.length }}）</button></div>
         <p v-if="refreshedAt" role="status">状态更新时间：{{ refreshedAt }}</p>
         <div v-if="activeBatch" class="status-strip"><span>排队 {{ activeBatch.counts?.QUEUED || 0 }}</span><span>生成中 {{ activeBatch.counts?.RUNNING || 0 }}</span><span>可预览 {{ activeBatch.counts?.READY || 0 }}</span><span>失败 {{ activeBatch.counts?.FAILED || 0 }}</span><span>已入库素材 {{ activeBatch.counts?.UPLOADED || 0 }}</span></div>
-        <section v-for="group in candidateGroups" :key="group.key" class="remix-candidate-group">
-          <label class="candidate-check"><input type="checkbox" :checked="group.items.every(item => item.selected)" :disabled="loading || !canUpload(group)" @change="toggleGroup(group)" /><strong>{{ group.title }}</strong><span>{{ group.items.length }} 条素材</span></label>
-          <small v-if="!canUpload(group)">{{ group.items.every(item => item.status === 'UPLOADED') ? '模板已入库' : '全部素材完成后可整组勾选入库' }}</small>
-          <label v-if="canUpload(group)">正式入库模型（单选）<select v-model="uploadModels[group.key]" @change="changeUploadModel(group.key)"><option value="" disabled>请选择模型</option><option v-for="model in availableModels" :key="model.code" :value="model.code">{{ model.name }}</option></select></label>
-          <div v-if="canUpload(group) && uploadModels[group.key]" class="remix-form-grid">
-            <label v-for="param in availableModels.find(model => model.code === uploadModels[group.key])?.params || []" :key="param.key">{{ param.label || param.key }}{{ param.required ? '（必填）' : '' }}
-              <select v-if="param.type === 'SELECT'" :value="uploadParameters[group.key]?.[param.key]" @change="setUploadParameter(group.key, param, $event)"><option value="">请选择</option><option v-for="option in param.options" :key="option.value" :value="option.value">{{ option.value }}</option></select>
-              <input v-else-if="param.type === 'BOOLEAN'" type="checkbox" :checked="uploadParameters[group.key]?.[param.key] === true" @change="setUploadParameter(group.key, param, $event)" />
-              <input v-else :type="param.type === 'NUMBER' ? 'number' : 'text'" :value="uploadParameters[group.key]?.[param.key]" @input="setUploadParameter(group.key, param, $event)" />
-            </label>
+        <details v-for="group in candidateGroups" :key="group.key" class="remix-candidate-group">
+          <summary class="remix-template-summary">
+            <strong>{{ group.title }}</strong>
+            <span>{{ group.items.length }} 条素材</span>
+            <span v-if="group.items.every(item => item.status === 'UPLOADED')">已入库</span>
+            <span v-else-if="canUpload(group)">可入库{{ group.items.every(item => item.selected) ? ' · 已选中' : '' }}</span>
+            <span v-else-if="group.items.some(isProcessing)">处理中 {{ group.items.filter(isProcessing).length }} 条</span>
+            <span v-if="group.items.some(item => item.status === 'FAILED' || item.status === 'UPLOAD_FAILED')">失败 {{ group.items.filter(item => item.status === 'FAILED' || item.status === 'UPLOAD_FAILED').length }} 条</span>
+          </summary>
+          <div class="remix-template-content">
+            <label v-if="canUpload(group)" class="candidate-check"><input type="checkbox" :checked="group.items.every(item => item.selected)" :disabled="loading" @change="toggleGroup(group)" />选中此模板入库</label>
+            <small v-if="!canUpload(group)">{{ group.items.every(item => item.status === 'UPLOADED') ? '模板已入库' : '全部素材完成后可整组勾选入库' }}</small>
+            <label v-if="canUpload(group)">正式入库模型（单选）<select v-model="uploadModels[group.key]" @change="changeUploadModel(group.key)"><option value="" disabled>请选择模型</option><option v-for="model in availableModels" :key="model.code" :value="model.code">{{ model.name }}</option></select></label>
+            <div v-if="canUpload(group) && uploadModels[group.key]" class="remix-form-grid">
+              <label v-for="param in availableModels.find(model => model.code === uploadModels[group.key])?.params || []" :key="param.key">{{ param.label || param.key }}{{ param.required ? '（必填）' : '' }}
+                <select v-if="param.type === 'SELECT'" :value="uploadParameters[group.key]?.[param.key]" @change="setUploadParameter(group.key, param, $event)"><option value="">请选择</option><option v-for="option in param.options" :key="option.value" :value="option.value">{{ option.value }}</option></select>
+                <input v-else-if="param.type === 'BOOLEAN'" type="checkbox" :checked="uploadParameters[group.key]?.[param.key] === true" @change="setUploadParameter(group.key, param, $event)" />
+                <input v-else :type="param.type === 'NUMBER' ? 'number' : 'text'" :value="uploadParameters[group.key]?.[param.key]" @input="setUploadParameter(group.key, param, $event)" />
+              </label>
+            </div>
+            <section v-for="section in candidateSections(group)" :key="section.role" class="candidate-role-section">
+                <strong>{{ section.title }}</strong>
+                <ul class="remix-status-list">
+                  <li v-for="item in section.items" :key="item.id">
+                    <button type="button" class="secondary" @click="showDetail(item)">
+                      {{ item.sourceAsset.name || item.sourceKey }} · {{ item.mediaType === 'VIDEO' ? '视频' : '图片' }} · {{ item.status }}
+                    </button>
+                  </li>
+                </ul>
+            </section>
           </div>
-          <section v-for="section in candidateSections(group)" :key="section.role" class="candidate-role-section">
-            <details>
-              <summary>{{ section.title }} · {{ section.items.length }} 条 · 处理中 {{ section.items.filter(isProcessing).length }} 条</summary>
-              <ul class="remix-status-list">
-                <li v-for="item in section.items" :key="item.id">
-                  <button type="button" class="secondary" @click="showDetail(item)">
-                    {{ item.sourceAsset.name || item.sourceKey }} · {{ item.mediaType === 'VIDEO' ? '视频' : '图片' }} · {{ item.status }}
-                  </button>
-                </li>
-              </ul>
-            </details>
-          </section>
-        </section>
+        </details>
         <div v-if="!candidateGroups.length" class="welcome"><div class="welcome-mark">V</div><h2>候选结果工作台</h2><p>创建批次或从左侧选择已有批次。</p></div>
       </div>
     </section>
@@ -393,6 +401,9 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
 .remix-source-row { display:grid; gap:10px; border-top:1px solid #e3e7e4; padding-top:12px; overflow-wrap:anywhere; }
 .remix-source-row strong { flex-basis:100%; }
 .remix-candidate-group { margin:16px 0; padding:16px; border:1px solid #d8ded9; border-radius:12px; }
+.remix-template-summary { cursor:pointer; overflow-wrap:anywhere; }
+.remix-template-summary span { margin-inline-start:12px; color:#657068; font-size:12px; }
+.remix-template-content { display:grid; gap:12px; margin-top:12px; padding-top:12px; border-top:1px solid #e3e7e4; }
 .remix-source-columns { display:grid; grid-template-columns:minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) auto; gap:16px; align-items:start; }
 .remix-source-columns > *, .remix-subject-cell { min-width:0; }
 .remix-subject-cell { display:grid; gap:8px; }
