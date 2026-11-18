@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-import RemixLinkPreview from './RemixLinkPreview.vue';
+import RemixMediaPreview from './RemixMediaPreview.vue';
 import { mediaMime, subjectsForImport, type ImportSource, type ImportSubject } from './remix-excel';
 const props = defineProps<{ source: ImportSource; role: 'INPUT' | 'COVER' | 'PREVIEW' }>();
 const accept = computed(() => props.role === 'COVER' ? 'image/*' : props.role === 'PREVIEW' ? 'video/*,image/gif,image/webp' : 'image/*,video/*');
@@ -35,10 +35,13 @@ function onSubjectUrl(event: Event, subject: ImportSubject) {
 </script>
 <template>
   <div class="asset-columns">
-    <label>原素材上传（与链接任选其一）
-      <input :key="source.file ? 'file' : 'empty'" type="file" :accept="accept" @change="onSource($event, source)" />
-      <small v-if="source.file">{{ source.file.name }}</small>
-    </label>
+    <div class="subject-cell">
+      <label>原素材上传（与链接任选其一）
+        <input :key="source.file ? 'file' : 'empty'" type="file" :accept="accept" @change="onSource($event, source)" />
+        <small v-if="source.file">{{ source.file.name }}</small>
+      </label>
+      <RemixMediaPreview v-if="source.file" :file="source.file" :video="source.mimeType.startsWith('video/')" />
+    </div>
     <div class="subject-cell">
       <label>原素材链接（与文件任选其一）
         <input type="url" :value="source.url || ''" maxlength="2048" placeholder="HTTP(S) 链接" @input="onSourceUrl($event, source)" />
@@ -49,7 +52,7 @@ function onSubjectUrl(event: Event, subject: ImportSubject) {
           <option v-if="role !== 'COVER'" value="video/mp4">视频</option>
         </select>
       </label>
-      <RemixLinkPreview v-if="!source.file" :url="source.url" :video="source.mimeType.startsWith('video/')" />
+      <RemixMediaPreview v-if="!source.file" :url="source.url" :video="source.mimeType.startsWith('video/')" />
     </div>
     <div class="subject-cell">
       <strong>主体组（最多 4 个）</strong>
@@ -58,7 +61,7 @@ function onSubjectUrl(event: Event, subject: ImportSubject) {
         <label>主体图片<input type="file" accept="image/*" @change="onSubject($event, subject)" /></label>
         <small v-if="subject.file">{{ subject.file.name }}</small>
         <label>主体图片链接<input type="url" :value="subject.url || ''" maxlength="2048" placeholder="或填写图片链接" @input="onSubjectUrl($event, subject)" /></label>
-        <RemixLinkPreview v-if="!subject.file" :url="subject.url" />
+        <RemixMediaPreview :file="subject.file" :url="subject.url" />
         <small>提示词引用：@{{ subject.subjectName }}</small>
         <button type="button" class="secondary" @click="removeSubject(index)">移除此主体</button>
       </div>
