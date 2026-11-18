@@ -2,7 +2,7 @@
 import { computed } from 'vue';
 import RemixMediaPreview from './RemixMediaPreview.vue';
 import { mediaMime, subjectsForImport, type ImportSource, type ImportSubject } from './remix-excel';
-const props = defineProps<{ source: ImportSource; role: 'INPUT' | 'COVER' | 'PREVIEW' }>();
+const props = defineProps<{ source: ImportSource; role: 'INPUT' | 'COVER' | 'PREVIEW'; subjectNames: string[] }>();
 const accept = computed(() => props.role === 'COVER' ? 'image/*' : props.role === 'PREVIEW' ? 'video/*,image/gif,image/webp' : 'image/*,video/*');
 function onSource(event: Event, source: ImportSource) {
   const file = (event.target as HTMLInputElement).files?.[0];
@@ -19,11 +19,10 @@ function onSourceUrl(event: Event, source: ImportSource) {
 }
 const subjects = computed(() => subjectsForImport(props.source));
 function addSubject() {
-  const list = [...subjects.value];
-  let index = 1;
-  while (list.some(subject => subject.subjectName === `主体${index}`)) index++;
-  list.push({ subjectName: `主体${index}` });
-  props.source.subjects = list; props.source.keepOriginal = false;
+  const subjectName = props.subjectNames[subjects.value.length];
+  if (!subjectName) return;
+  props.source.subjects = [...subjects.value, {}];
+  props.source.keepOriginal = false;
 }
 function removeSubject(index: number) { props.source.subjects = subjects.value.filter((_, i) => i !== index); }
 function onSubject(event: Event, subject: ImportSubject) {
@@ -55,21 +54,21 @@ function onSubjectUrl(event: Event, subject: ImportSubject) {
       <RemixMediaPreview v-if="!source.file" :url="source.url" :video="source.mimeType.startsWith('video/')" />
     </div>
     <div class="subject-cell">
-      <strong>主体组（最多 4 个）</strong>
+      <strong>主体组（可选，最多 4 个）</strong>
       <div v-for="(subject, index) in subjects" :key="index" class="subject-cell">
-        <label>主体名称<input v-model="subject.subjectName" maxlength="80" placeholder="例如：男主、女主、商品" /></label>
+        <strong>{{ subjectNames[index] }}</strong>
         <label>主体图片<input type="file" accept="image/*" @change="onSubject($event, subject)" /></label>
         <small v-if="subject.file">{{ subject.file.name }}</small>
         <label>主体图片链接<input type="url" :value="subject.url || ''" maxlength="2048" placeholder="或填写图片链接" @input="onSubjectUrl($event, subject)" /></label>
         <RemixMediaPreview :file="subject.file" :url="subject.url" />
-        <small>提示词引用：@{{ subject.subjectName }}</small>
+        <small>提示词引用：@{{ subjectNames[index] }}</small>
         <button type="button" class="secondary" @click="removeSubject(index)">移除此主体</button>
       </div>
-      <button v-if="subjects.length < 4" type="button" class="secondary" @click="addSubject">＋ 添加主体</button>
+      <button v-if="subjects.length < subjectNames.length" type="button" class="secondary" @click="addSubject">＋ 添加主体</button>
       <small v-if="!subjects.length">未配置主体，保留原素材</small>
     </div>
   </div>
-  <label>此素材替换要求<textarea v-model="source.prompt" rows="2" maxlength="5000" placeholder="例如：将左侧人物替换为 @男主，右侧人物替换为 @女主，桌上物品替换为 @商品" /></label>
+  <label>此素材替换要求<textarea v-model="source.prompt" rows="2" maxlength="5000" placeholder="例如：将左侧人物替换为 @主体1，右侧人物替换为 @主体2" /></label>
 </template>
 <style scoped>
 .asset-columns { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; align-items:start; }

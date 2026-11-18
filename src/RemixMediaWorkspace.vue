@@ -16,6 +16,7 @@ const props = defineProps<{ adminKey: string; templateType: 'IMAGE_GENERATION' |
 const apiBase = (import.meta.env.VITE_REMIX_API_BASE || '/remix-api').replace(/\/$/, '');
 const mediaLabel = computed(() => props.templateType === 'IMAGE_GENERATION' ? '图片' : '视频');
 const prompt = ref('');
+const subjectNames = ref<string[]>([]);
 type TemplateForm = ImportTemplate;
 const templates = ref<TemplateForm[]>([]);
 const models = ref<Model[]>([]);
@@ -100,9 +101,8 @@ async function createAndStart() {
     for (const [index, source] of [...group.assets, ...(group.cover ? [group.cover] : []), ...(group.preview ? [group.preview] : [])].entries()) {
       if (!source.file && !source.url?.trim()) { error.value = `${group.title} 第 ${index + 1} 行：请上传原素材或填写原素材链接`; return; }
       const subjects = subjectsForImport(source);
-      const names = subjects.map(subject => subject.subjectName.trim());
-      if (subjects.length > 4 || new Set(names).size !== names.length || names.some(name => !/^[\p{L}\p{N}_-]{1,80}$/u.test(name)) || subjects.some(subject => !subject.file && !subject.url)) {
-        error.value = `${group.title} 第 ${index + 1} 行：主体组最多 4 个，每个主体须有图片及唯一名称（文字、数字、下划线或短横线）`; return;
+      if (subjects.length > 4 || subjects.some(subject => !subject.file && !subject.url)) {
+        error.value = `${group.title} 第 ${index + 1} 行：主体组最多 4 个，每个已添加的主体需要一张图片`; return;
       }
       if (!source.file && source.url) source.mimeType = mediaMime(source.url) || source.mimeType;
       for (const url of [source.file ? undefined : source.url, ...subjectsForImport(source).map(subject => subject.file ? undefined : subject.url)]) {
@@ -137,7 +137,7 @@ async function createAndStart() {
         const subjectAssets = [];
         for (const subject of source.keepOriginal ? [] : subjectsForImport(source)) {
           const reference = subject.file ? await uploadOnce(subject.file) : { url: subject.url, mimeType: mediaMime(subject.url || '') || 'image/jpeg' };
-          subjectAssets.push({ ...reference, subjectName: subject.subjectName.trim() });
+          subjectAssets.push(reference);
         }
         items.push({ sourceKey: `${groupIndex + 1}-${assetIndex + 1}-${assetRole}`, assetRole,
           mediaType: source.mimeType.startsWith('video/') ? 'VIDEO' : 'IMAGE', sourceAsset: asset,
@@ -150,7 +150,7 @@ async function createAndStart() {
     const created = await request('/template-remix/batches/import', { method: 'POST', body: JSON.stringify({ name: batchName, defaultPrompt: prompt.value, templateType: props.templateType, items }) });
     templates.value = [];
     await loadBatches(); await openBatch(created.batch.id);
-    const started = await request(`/template-remix/batches/${encodeURIComponent(created.batch.id)}/start`, { method: 'POST', body: JSON.stringify({ promptAddition: prompt.value }) });
+    const started = items.some(item => item.subjectAssets.length) ? await request(`/template-remix/batches/${encodeURIComponent(created.batch.id)}/start`, { method: 'POST', body: JSON.stringify({ promptAddition: prompt.value }) }) : { queued: 0 };
     notice.value = `已导入 ${templateCount} 个模板、${items.length} 条素材，其中 ${started.queued} 条进入替换队列`;
     await loadBatches(); await openBatch(created.batch.id);
   } catch (reason) { error.value = reason instanceof Error ? reason.message : '批次创建失败'; }
@@ -162,6 +162,7 @@ async function loadConfig() {
   const data = await request('/template-remix/config');
   if (!Array.isArray(data.models)) throw new Error('主体替换配置接口响应缺少 models 数组，请检查后端服务版本');
   models.value = data.models;
+  subjectNames.value = Array.isArray(data.subjectNames) ? data.subjectNames : [];
   if (Number.isInteger(data.maxItemsPerBatch)) maxItems.value = data.maxItemsPerBatch;
 }
 
@@ -199,6 +200,7 @@ async function toggleGroup(group: CandidateGroup) {
 
 async function regenerate(item: Item) {
   loading.value = true;
+  error.value = '';
   try { await request(`/template-remix/items/${encodeURIComponent(item.id)}/regenerate`, { method: 'POST', body: JSON.stringify({ promptAddition: prompt.value }) }); if (activeBatch.value) await openBatch(activeBatch.value.id); }
   catch (reason) { error.value = reason instanceof Error ? reason.message : '重新生成失败'; }
   finally { loading.value = false; }
@@ -251,11 +253,21 @@ async function importExcel(event: Event) {
 function downloadExcel() {
   const workbook = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([
-    ['模板标识', '模板名称', '媒体类型', '原素材', '主体图片', '替换要求', '模板提示词', '指定封面', '封面主体图片', '指定预览', '预览主体图片', ...['', '封面', '预览'].flatMap(prefix => Array.from({ length: 4 }, (_, i) => i === 0 ? [`${prefix}主体名称`] : [`${prefix}主体图片${i + 1}`, `${prefix}主体名称${i + 1}`]).flat())],
+    ['模板标识', '模板名称', '媒体类型', '原素材', '主体图片', '替换要求', '模板提示词', '指定封面', '封面主体图片', '指定预览', '预览主体图片', ...['', '封面', '预览'].flatMap(prefix => Array.from({ length: 3 }, (_, i) => `${prefix}主体图片${i + 2}`))],
     ['template-1', '多素材示例', '图片', 'https://example.com/1.jpg', 'https://example.com/person1.png', '', '根据用户输入生成同风格内容', 'https://example.com/cover.gif', '', 'https://example.com/preview.mp4', ''],
     ['template-1', '多素材示例', '视频', 'https://example.com/1.mp4', 'https://example.com/person2.png', '', ''],
   ]), '素材');
   XLSX.writeFile(workbook, '主体替换批量导入.xlsx');
+}
+const detailDialog = ref<HTMLDialogElement>();
+const detailId = ref('');
+const detailItem = computed(() => activeBatch.value?.items?.find(item => item.id === detailId.value));
+function showDetail(item: Item) {
+  detailId.value = item.id;
+  detailDialog.value?.showModal();
+}
+function isProcessing(item: Item) {
+  return ['IMPORTED', 'QUEUED', 'RUNNING', 'UPLOADING'].includes(item.status);
 }
 function hasSubject(item: Item) { return item.sourceAsset.subjectAssets?.length !== 0; }
 
@@ -287,12 +299,12 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
           <label>模板名称<input v-model="group.title" maxlength="200" /></label>
             <div class="remix-display-assets">
               <fieldset><legend>指定封面 · 静态图或动态图</legend>
-                <RemixAssetInputs v-if="group.cover" :source="group.cover" role="COVER" />
+                <RemixAssetInputs :subject-names="subjectNames" v-if="group.cover" :source="group.cover" role="COVER" />
                 <button v-if="!group.cover" type="button" class="secondary" @click="group.cover = { name: '指定封面', mimeType: 'image/jpeg' }">＋ 指定封面</button>
                 <button v-else type="button" class="secondary" @click="group.cover = undefined">移除指定封面</button>
               </fieldset>
               <fieldset><legend>指定预览 · 视频或动态图</legend>
-                <RemixAssetInputs v-if="group.preview" :source="group.preview" role="PREVIEW" />
+                <RemixAssetInputs :subject-names="subjectNames" v-if="group.preview" :source="group.preview" role="PREVIEW" />
                 <button v-if="!group.preview" type="button" class="secondary" @click="group.preview = { name: '指定预览', mimeType: 'video/mp4' }">＋ 指定预览</button>
                 <button v-else type="button" class="secondary" @click="group.preview = undefined">移除指定预览</button>
               </fieldset>
@@ -300,7 +312,7 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
           <h4>普通生成素材 · 仅用于模板生成入参</h4>
           <div v-for="(source, assetIndex) in group.assets" :key="sourceRowKey(source)" class="remix-source-row">
             <strong>素材 {{ assetIndex + 1 }} · 生成入参</strong>
-            <RemixAssetInputs :source="source" role="INPUT" />
+            <RemixAssetInputs :subject-names="subjectNames" :source="source" role="INPUT" />
             <button type="button" class="secondary" @click="group.assets.splice(assetIndex, 1)">移除此行</button>
           </div>
           <button type="button" class="secondary" @click="addSource(group)">＋ 新增素材行</button>
@@ -333,24 +345,47 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
             </label>
           </div>
           <section v-for="section in candidateSections(group)" :key="section.role" class="candidate-role-section">
-            <h4>{{ section.title }}</h4>
-            <div class="candidate-grid">
-            <article v-for="item in section.items" :key="item.id" class="candidate-card" :class="{ checked: item.selected }">
-              <div class="candidate-media"><video v-if="item.mediaType === 'VIDEO'" :src="item.currentAttempt?.resultAsset?.url || item.sourceAsset.url" controls preload="metadata" /><img v-else :src="item.currentAttempt?.resultAsset?.url || item.sourceAsset.url" :alt="item.sourceKey" loading="lazy" /></div>
-              <div class="candidate-copy"><span>{{ item.sourceKey }} · {{ item.sourceAsset.assetRole === 'COVER' ? '指定封面' : item.sourceAsset.assetRole === 'PREVIEW' ? '指定预览' : '生成入参' }}</span><small>{{ hasSubject(item) ? '主体替换：' + (item.sourceAsset.subjectAssets || []).map((subject, index) => '@' + (subject.subjectName || `主体${index + 1}`)).join('、') : '保留原素材' }}</small><span class="state-pill" :data-state="item.status">{{ item.status }}</span></div>
-              <p v-if="item.currentAttempt?.providerError" class="item-error">{{ item.currentAttempt.providerError.code }} · {{ item.currentAttempt.providerError.message }}</p>
-              <div class="candidate-actions"><small>{{ item.mediaType }} · 第 {{ item.currentAttempt?.sequence || 0 }} 次</small><button class="secondary" :disabled="loading || !hasSubject(item) || ['UPLOADED', 'QUEUED', 'RUNNING', 'UPLOADING'].includes(item.status)" @click="regenerate(item)">重新生成此素材</button></div>
-            </article>
-          </div>
+            <details>
+              <summary>{{ section.title }} · {{ section.items.length }} 条 · 处理中 {{ section.items.filter(isProcessing).length }} 条</summary>
+              <ul class="remix-status-list">
+                <li v-for="item in section.items" :key="item.id">
+                  <button type="button" class="secondary" @click="showDetail(item)">
+                    {{ item.sourceAsset.name || item.sourceKey }} · {{ item.mediaType === 'VIDEO' ? '视频' : '图片' }} · {{ item.status }}
+                  </button>
+                </li>
+              </ul>
+            </details>
           </section>
         </section>
         <div v-if="!candidateGroups.length" class="welcome"><div class="welcome-mark">V</div><h2>候选结果工作台</h2><p>创建批次或从左侧选择已有批次。</p></div>
       </div>
     </section>
+    <dialog ref="detailDialog" class="remix-detail" aria-labelledby="remix-detail-title">
+      <form method="dialog"><button class="secondary">关闭</button></form>
+      <template v-if="detailItem">
+        <h3 id="remix-detail-title">{{ detailItem.sourceAsset.name || detailItem.sourceKey }}</h3>
+        <p>{{ detailItem.status }} · 第 {{ detailItem.currentAttempt?.sequence || 0 }} 次</p>
+        <p>{{ hasSubject(detailItem) ? (detailItem.sourceAsset.subjectAssets || []).map((subject, index) => '@' + (subject.subjectName || `主体${index + 1}`)).join('、') || '主体替换' : '保留原素材' }}</p>
+        <div class="candidate-media">
+          <video v-if="detailItem.mediaType === 'VIDEO'" :src="detailItem.currentAttempt?.resultAsset?.url || detailItem.sourceAsset.url" controls preload="metadata" />
+          <img v-else :src="detailItem.currentAttempt?.resultAsset?.url || detailItem.sourceAsset.url" :alt="detailItem.sourceKey" />
+        </div>
+        <p v-if="detailItem.currentAttempt?.providerError" class="item-error">{{ detailItem.currentAttempt.providerError.code }} · {{ detailItem.currentAttempt.providerError.message === 'fetch failed' ? '此前的 Worker 未记录具体网络原因，重新生成后可查看详细错误。' : detailItem.currentAttempt.providerError.message }}</p>
+        <p v-if="error" role="alert">{{ error }}</p>
+        <small v-if="detailItem.currentAttempt">任务编号 {{ detailItem.currentAttempt.id }}</small>
+        <div v-if="hasSubject(detailItem)">
+          <button type="button" class="secondary" :disabled="loading || isProcessing(detailItem) || detailItem.status === 'UPLOADED'" @click="regenerate(detailItem)">重新生成此素材</button>
+        </div>
+      </template>
+    </dialog>
   </main>
 </template>
 
 <style scoped>
+.remix-status-list { display:grid; gap:8px; padding-left:20px; }
+.remix-detail { width:min(600px, 90vw); max-height:85vh; border:1px solid #d8ded9; border-radius:12px; padding:20px; overflow-wrap:anywhere; }
+.remix-detail::backdrop { background:rgba(0,0,0,.4); }
+
 .remix-excel-entry { display:flex; flex-wrap:wrap; gap:12px; align-items:center; padding:16px; margin-bottom:24px; border:1px solid #d8ded9; border-radius:12px; background:#f7faf7; }
 .remix-excel-entry small { flex-basis:100%; }
 .remix-template-form { min-width:0; display:grid; gap:12px; padding:18px; border:1px solid #d8ded9; border-radius:12px; }

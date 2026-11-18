@@ -1,11 +1,11 @@
 import * as XLSX from 'xlsx';
 import { unzipSync } from 'fflate';
 
-export type ImportSubject = { subjectName: string; file?: File; url?: string };
+export type ImportSubject = { file?: File; url?: string };
 export function subjectsForImport(source: ImportSource): ImportSubject[] {
-  return source.subjects ?? (source.subjectFile || source.subjectUrl ? [{ subjectName: source.subjectName || "主体1", file: source.subjectFile, url: source.subjectUrl }] : []);
+  return source.subjects ?? (source.subjectFile || source.subjectUrl ? [{ file: source.subjectFile, url: source.subjectUrl }] : []);
 }
-export type ImportSource = { subjects?: ImportSubject[]; subjectName?: string; assetRole?: 'INPUT' | 'COVER' | 'PREVIEW'; keepOriginal?: boolean; templateKey?: string; name: string; file?: File; url?: string; mimeType: string; subjectFile?: File; subjectUrl?: string; title?: string; templatePrompt?: string; prompt?: string };
+export type ImportSource = { subjects?: ImportSubject[]; assetRole?: 'INPUT' | 'COVER' | 'PREVIEW'; keepOriginal?: boolean; templateKey?: string; name: string; file?: File; url?: string; mimeType: string; subjectFile?: File; subjectUrl?: string; title?: string; templatePrompt?: string; prompt?: string };
 export function mediaMime(name: string): string {
   let path = name.split(/[?#]/)[0] || '';
   try { path = new URL(name).pathname; } catch { /* 本地文件名直接读取后缀 */ }
@@ -91,14 +91,10 @@ export async function readRemixExcel(file: File): Promise<ImportSource[]> {
           if (values.length > 1) throw new Error(`${sheetName} 第 ${row + 1} 行：每个主体只允许一张参考图片`);
           const value = values[0];
           const url = value?.url || cellText(row, column);
-          const subjectName = cellText(row, headers.indexOf(`${prefix}主体名称${suffix}`));
-          if (!value?.file && !url) {
-            if (subjectName) throw new Error(`主体“${subjectName}”缺少图片`);
-            continue;
-          }
+          if (!value?.file && !url) continue;
           if (url && !/^https?:\/\//i.test(url)) throw new Error('主体链接无效');
           if (value?.file && !value.file.type.startsWith('image/')) throw new Error('主体必须是图片');
-          subjects.push({ subjectName: subjectName || `主体${index}`, file: value?.file, url: value?.file ? undefined : url });
+          subjects.push({ file: value?.file, url: value?.file ? undefined : url });
         }
         return subjects;
       };
