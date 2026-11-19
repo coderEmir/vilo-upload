@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, toRaw, watch } from 'vue';
 import * as XLSX from 'xlsx';
-import { unzipSync } from 'fflate';
+import { uploadTemplateFile, readTemplateEmbeddedMedia, isPreviewMime, storedMedia, previewMedia } from './template-media';
+import { mediaMime } from './remix-excel';
 import { normalizeAdminKey, verifyAdminKey, type AdminKeyStatus } from './admin-auth';
 import { modelMatchesTemplateType, resolveTemplateModel, type Model, type ModelParam, type TemplateType } from './template-models';
 import RemixWorkspace from './RemixWorkspace.vue';
@@ -32,6 +33,7 @@ const uploading = ref(false);
 const importing = ref(false);
 const importInput = ref<HTMLInputElement | null>(null);
 const currentEpisode = computed(() => draft.value?.episodes[activeEpisode.value]);
+const currentPreview = computed(() => previewMedia(currentEpisode.value?.mediaAssets || []));
 const selectedModel = computed(() => models.value.find((model) => model.code === currentEpisode.value?.modelCode));
 const visibleTemplates = computed(() => templates.value.filter((template) => template.type === activeType.value));
 const isComicDrama = computed(() => draft.value?.type === 'COMIC_DRAMA' || draft.value?.type === 'MV');
@@ -63,7 +65,7 @@ async function request(path: string, init: RequestInit = {}) {
   return response.status === 204 ? null : response.json();
 }
 async function uploadAsset(file: File, assign: (url: string) => void) {
-  if (!file.type.startsWith('image/') && !file.type.startsWith('video/')) { error.value = '仅支持图片或视频文件'; return; }
+  if (!file.type.startsWith('image/')) { error.value = '封面必须是图片'; return; }
   uploading.value = true; error.value = '';
   try {
     const response = await fetch(`${apiBase}/templates/assets`, { method: 'POST', body: file, headers: { 'Content-Type': file.type, 'x-template-admin-key': adminKey.value } });
@@ -75,11 +77,7 @@ async function uploadAsset(file: File, assign: (url: string) => void) {
   finally { uploading.value = false; }
 }
 async function uploadAssetFile(file: File): Promise<string> {
-  if (!file.type.startsWith('image/')) throw new Error(`封面必须是图片文件：${file.name}`);
-  const response = await fetch(`${apiBase}/templates/assets`, { method: 'POST', body: file, headers: { 'Content-Type': file.type, 'x-template-admin-key': adminKey.value } });
-  const payload = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(payload?.error?.message || `封面上传失败 (${response.status})`);
-  return payload.url as string;
+  return uploadTemplateFile(file, apiBase, adminKey.value);
 }
 function workbookTemplate() {
   const common = [
@@ -94,7 +92,7 @@ function workbookTemplate() {
   const parameterColumns = availableModels.value.flatMap((model) => model.params.filter((param) => param.required && isTemplateControlledParam(param)))
     .filter((param) => !seen.has(param.key) && seen.add(param.key))
     .map((param) => [`模型参数-${param.label} [${param.key}]（按模型配置必填）`, excelParamKey(param.key)]);
-  const columns = activeType.value === 'COMIC_DRAMA' ? [...common, ...comic] : [...common, ...generation, ...parameterColumns];
+  const columns = activeType.value === 'COMIC_DRAMA' ? [...common, ...comic] : [...common, ...generation, ['预览视频或动图（可插入媒体）', 'previewUrl'], ...parameterColumns];
   const headers = columns.map(([label]) => label);
   const sample: Record<string, unknown> = { title: '', slug: '', category: '', description: '', coverUrl: '', tags: '', status: 'DRAFT', active: '是', premium: '否', sortOrder: 0 };
   const model = modelForType(activeType.value);
@@ -123,59 +121,12 @@ function downloadExcelTemplate() {
     [`可用模型：${availableModels.value.map((model) => `${model.name} (${model.code})`).join('；')}`],
     [activeType.value === 'COMIC_DRAMA' ? '漫剧上传入口当前隐藏，但原批量导入能力保留。' : '图片上传、画面比例、分辨率由客户端用户选择，不在模板参数中填写。'],
     ['封面可填写图片 URL，也可在 Excel 中将图片插入对应数据行。若两者同时提供，使用 URL。'],
-    ['带“（必填）”的列必须填写。删除此说明工作表不会影响导入；请勿修改或删除首个工作表的标题行。'],
+    ['预览视频或动图列支持内嵌视频、GIF、WebP；预览上传 OSS 后写入 mediaAssets，生成素材单独写入 referenceAssets。'],
+    ['填写说明页可用“模板标识、模板名称、素材用途、内嵌原文件”列保存多条生成素材，标识对应主表唯一标识。'],
+    ['来源没有生成提示词时保留空白，不补写；其他必填项按模型校验。若说明页含内嵌生成素材，请保留该页；请勿修改首个工作表已有列标题。'],
   ]);
   XLSX.utils.book_append_sheet(workbook, help, '填写说明');
   XLSX.writeFile(workbook, `Vilo-${typeLabel.value}-模板导入表.xlsx`);
-}
-type EmbeddedImage = { row: number; file: File; sheetName: string };
-function extractEmbeddedImages(buffer: ArrayBuffer, requestedSheetName: string): EmbeddedImage[] {
-  const files = unzipSync(new Uint8Array(buffer));
-  const workbookXml = new TextDecoder().decode(files['xl/workbook.xml'] || new Uint8Array());
-  const relsXml = new TextDecoder().decode(files['xl/_rels/workbook.xml.rels'] || new Uint8Array());
-  const sheetEntry = (workbookXml.match(/<sheet\b[^>]*\/?\s*>/gi) || []).find((tag) => tag.match(/\bname="([^"]+)"/i)?.[1] === requestedSheetName);
-  const sheetId = sheetEntry?.match(/\br:id="([^"]+)"/i)?.[1];
-  const sheetName = requestedSheetName;
-  const relationshipTarget = (xml: string, id: string) => {
-    for (const relationship of xml.matchAll(/<Relationship\b[^>]*\/?\s*>/gi)) {
-      if (relationship[0].match(/\bId="([^"]+)"/i)?.[1] === id) return relationship[0].match(/\bTarget="([^"]+)"/i)?.[1] || null;
-    }
-    return null;
-  };
-  const sheetTarget = sheetId ? relationshipTarget(relsXml, sheetId) : null;
-  if (!sheetTarget) return [];
-  const normalizePath = (base: string, target: string) => {
-    const parts = (target.startsWith('/') ? target.slice(1) : `${base}/${target}`).split('/');
-    const normalized: string[] = [];
-    for (const part of parts) { if (!part || part === '.') continue; if (part === '..') normalized.pop(); else normalized.push(part); }
-    return normalized.join('/');
-  };
-  const sheetPath = normalizePath('xl', sheetTarget);
-  const sheetXml = new TextDecoder().decode(files[sheetPath] || new Uint8Array());
-  const drawingRelId = sheetXml.match(/<drawing\b[^>]*r:id="([^"]+)"/i)?.[1];
-  const sheetRelPath = sheetPath.replace(/([^/]+)$/, '_rels/$1.rels');
-  const sheetRels = new TextDecoder().decode(files[sheetRelPath] || new Uint8Array());
-  const drawingTarget = drawingRelId ? relationshipTarget(sheetRels, drawingRelId) : null;
-  if (!drawingTarget) return [];
-  const drawingPath = normalizePath(sheetPath.slice(0, sheetPath.lastIndexOf('/')), drawingTarget);
-  const drawingXml = new TextDecoder().decode(files[drawingPath] || new Uint8Array());
-  const drawingRelPath = drawingPath.replace(/([^/]+)$/, '_rels/$1.rels');
-  const drawingRels = new TextDecoder().decode(files[drawingRelPath] || new Uint8Array());
-  const images: EmbeddedImage[] = [];
-  const anchors = drawingXml.match(/<(?:\w+:)?(?:oneCellAnchor|twoCellAnchor)\b[\s\S]*?<\/(?:\w+:)?(?:oneCellAnchor|twoCellAnchor)>/gi) || [];
-  for (const anchor of anchors) {
-    const row = Number(anchor.match(/<(?:\w+:)?from\b[^>]*>[\s\S]*?<(?:\w+:)?row>(\d+)<\/(?:\w+:)?row>/i)?.[1]);
-    const relId = anchor.match(/<(?:\w+:)?blip\b[^>]*(?:r:embed|embed)="([^"]+)"/i)?.[1];
-    const target = relId ? relationshipTarget(drawingRels, relId) : null;
-    if (!Number.isFinite(row) || !target) continue;
-    const path = normalizePath(drawingPath.slice(0, drawingPath.lastIndexOf('/')), target);
-    const bytes = files[path];
-    if (!bytes) continue;
-    const ext = path.split('.').pop()?.toLowerCase() || 'png';
-    const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'gif' ? 'image/gif' : ext === 'webp' ? 'image/webp' : 'image/png';
-    images.push({ row: row + 1, file: new File([bytes], `excel-cover-${row + 1}.${ext}`, { type: mime }), sheetName });
-  }
-  return images;
 }
 function nonEmpty(value: unknown): string { return value === undefined || value === null ? '' : String(value).trim(); }
 async function importExcel(event: Event) {
@@ -190,22 +141,22 @@ async function importExcel(event: Event) {
     const sheetName = workbook.SheetNames.find((name) => !['填写说明', '说明'].includes(name)) || workbook.SheetNames[0];
     const sheet = workbook.Sheets[sheetName];
     if (!sheet) throw new Error('Excel 中没有可读取的工作表');
-    const matrix = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1, defval: '', raw: false, blankrows: false });
+    const matrix = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1, defval: '', raw: false, blankrows: true });
     const headers = (matrix[0] || []).map((header) => nonEmpty(header));
     const dataRows = matrix.slice(1);
     if (!headers.length || !dataRows.length) throw new Error('Excel 中没有标题行或数据行');
     const columnTemplate = workbookTemplate();
     const normalized = (value: string) => value.trim().replace(/\s/g, '').replace(/[（(]必填[）)]/g, '').replace(/[：:]/g, '').toLowerCase();
     const headerToKey = new Map(columnTemplate.headers.map((label, index) => [normalized(label), columnTemplate.columns[index][1] as string]));
-    const aliases: Record<string, string> = { 封面图: 'coverUrl', 封面图片: 'coverUrl', 封面图链接: 'coverUrl', 封面链接: 'coverUrl', 提示词: activeType.value === 'COMIC_DRAMA' ? 'description' : 'promptTemplate', 生成提示词: 'promptTemplate', 模板描述: 'description', 模板名称: 'title', 模板标题: 'title', 唯一标识: 'slug', slug: 'slug', 分类: 'category', 标签: 'tags', 剧集序号: 'episodeNumber', 剧集标题: 'episodeTitle', 模型编码: 'modelCode', 正向提示词: 'promptTemplate', 负向提示词: 'negativePrompt' };
+    const aliases: Record<string, string> = { 预览视频: 'previewUrl', 预览动图: 'previewUrl', 指定预览: 'previewUrl', 封面图: 'coverUrl', 封面图片: 'coverUrl', 封面图链接: 'coverUrl', 封面链接: 'coverUrl', 提示词: activeType.value === 'COMIC_DRAMA' ? 'description' : 'promptTemplate', 生成提示词: 'promptTemplate', 模板描述: 'description', 模板名称: 'title', 模板标题: 'title', 唯一标识: 'slug', slug: 'slug', 分类: 'category', 标签: 'tags', 剧集序号: 'episodeNumber', 剧集标题: 'episodeTitle', 模型编码: 'modelCode', 正向提示词: 'promptTemplate', 负向提示词: 'negativePrompt' };
     const keys = headers.map((header) => headerToKey.get(normalized(header)) || aliases[normalized(header)] || '');
     const missingHeaders = columnTemplate.headers.filter((label) => label.includes('（必填）') && !keys.includes(columnTemplate.columns[columnTemplate.headers.indexOf(label)][1] as string));
     if (missingHeaders.length) throw new Error(`缺少必填列：${missingHeaders.join('、')}`);
     const mapped = dataRows.map((cells) => Object.fromEntries(keys.flatMap((key, index) => key ? [[key, cells[index] ?? '']] : [])));
-    const embedded = extractEmbeddedImages(buffer, sheetName);
+    const embedded = readTemplateEmbeddedMedia(buffer, workbook, sheetName);
     let created = 0;
     const failures: string[] = [];
-    const imageRows = embedded.filter((image) => image.sheetName === sheetName);
+    const imageRows = embedded.filter((image) => image.role === 'COVER');
     const importRows = mapped.map((row, index) => ({ row, excelRow: index + 2 })).filter(({ row, excelRow }) => {
       const hasValues = Object.values(row).some((value) => nonEmpty(value));
       const hasImage = imageRows.some((image) => image.row === excelRow);
@@ -240,6 +191,19 @@ async function importExcel(event: Event) {
         const tags = nonEmpty(row.tags).split(/[,，]/).map((tag) => tag.trim()).filter(Boolean);
         const booleanValue = (value: unknown, fallback: boolean) => value === '' || value === undefined ? fallback : ['是', 'true', '1', 'yes', 'y'].includes(nonEmpty(value).toLowerCase());
         const episodes: Episode[] = [];
+        const uploadRowMedia = async (excelRow: number, episode: Episode, row: Record<string, unknown>) => {
+          const assets = embedded.filter(asset => asset.row === excelRow);
+          const previews = assets.filter(asset => asset.role === 'PREVIEW');
+          const references = assets.filter(asset => asset.role === 'INPUT');
+          const previewUrl = nonEmpty(row.previewUrl);
+          if (previewUrl && previews.length) throw new Error('预览列不能同时填写链接和内嵌媒体');
+          if (previewUrl) {
+            if (!/^https?:\/\//i.test(previewUrl)) throw new Error('预览链接必须是 HTTP(S)');
+            episode.mediaAssets = [storedMedia(previewUrl, mediaMime(previewUrl), 'PREVIEW')];
+          }
+          for (const asset of previews) episode.mediaAssets.push(storedMedia(await uploadAssetFile(asset.file), asset.file.type, 'PREVIEW', asset.file.name));
+          for (const asset of references) episode.referenceAssets.push(storedMedia(await uploadAssetFile(asset.file), asset.file.type, 'INPUT', asset.file.name));
+        };
         if (activeType.value === 'COMIC_DRAMA') {
           if (new Set(group.episodes.map((episode) => Number(episode.row.episodeNumber))).size !== group.episodes.length) throw new Error('同一模板的剧集序号不能重复');
           for (const episodeRow of group.episodes) {
@@ -255,7 +219,7 @@ async function importExcel(event: Event) {
         } else {
           const modelReference = nonEmpty(row.modelCode), promptTemplate = nonEmpty(row.promptTemplate);
           const model = resolveTemplateModel(models.value, modelReference, activeType.value);
-          if (!model || !promptTemplate) throw new Error('有效模型编码/名称和生成提示词必填');
+          if (!model) throw new Error('有效模型编码或名称必填');
           const parameters = Object.fromEntries(model.params.filter(isTemplateControlledParam).map((param) => {
             const imported = row[excelParamKey(param.key)];
             const value = hasParamValue(imported) ? imported : defaultParamValue(param);
@@ -266,6 +230,10 @@ async function importExcel(event: Event) {
           const missingParams = model.params.filter((param) => param.required && isTemplateControlledParam(param) && !hasParamValue(parameters[param.key]));
           if (missingParams.length) throw new Error(`模型「${model.name}」缺少必填参数：${missingParams.map((param) => param.label).join('、')}`);
           episodes.push({ ...emptyEpisode(1, model), title, synopsis: description, modelCode: model.code, promptTemplate, negativePrompt: nonEmpty(row.negativePrompt), parameters });
+        }
+        for (let i = 0; i < episodes.length; i++) {
+          const source = activeType.value === 'COMIC_DRAMA' ? group.episodes[i] : group;
+          await uploadRowMedia(source.excelRow, episodes[i], source.row);
         }
         const sortOrder = Number(row.sortOrder) || 0;
         if (!Number.isInteger(sortOrder)) throw new Error('排序权重必须为整数');
@@ -290,9 +258,29 @@ function handleDrop(event: DragEvent, assign: (url: string) => void) {
   if (file) void uploadAsset(file, assign);
 }
 function chooseFile(assign: (url: string) => void) {
-  const input = document.createElement('input'); input.type = 'file'; input.accept = 'image/*,video/*';
+  const input = document.createElement('input'); input.type = 'file'; input.accept = 'image/*';
   input.onchange = () => { const file = input.files?.[0]; if (file) void uploadAsset(file, assign); };
   input.click();
+}
+async function uploadPreviewFile(file?: File) {
+  if (!file || !currentEpisode.value || uploading.value) return;
+  const episode = currentEpisode.value;
+  const mime = file.type || mediaMime(file.name);
+  if (!isPreviewMime(mime)) { error.value = '预览仅支持视频、GIF 或 WebP 动图'; return; }
+  uploading.value = true; error.value = '';
+  try {
+    const url = await uploadAssetFile(file.type ? file : new File([file], file.name, { type: mime }));
+    episode.mediaAssets = [storedMedia(url, mime, 'PREVIEW', file.name)];
+    notice.value = '预览上传完成，请保存模板';
+  } catch (e) { error.value = e instanceof Error ? e.message : '预览上传失败'; }
+  finally { uploading.value = false; }
+}
+function choosePreviewFile() {
+  const input = document.createElement('input'); input.type = 'file'; input.accept = 'video/*,image/gif,image/webp';
+  input.onchange = () => { void uploadPreviewFile(input.files?.[0]); }; input.click();
+}
+function dropPreviewFile(event: DragEvent) {
+  event.preventDefault(); void uploadPreviewFile(event.dataTransfer?.files?.[0]);
 }
 async function load() {
   loading.value = true; error.value = '';
@@ -405,7 +393,6 @@ async function save() {
       const episode = sanitized.episodes[0];
       const model = models.value.find((item) => item.code === episode?.modelCode);
       if (!episode || !model) throw new Error('请选择与模板类型匹配的模型');
-      if (!episode.promptTemplate.trim()) throw new Error('生成提示词必填');
       const missingParams = model.params.filter((param) => param.required && isTemplateControlledParam(param) && !hasParamValue(episode.parameters[param.key]));
       if (missingParams.length) throw new Error(`请填写模型必填参数：${missingParams.map((param) => param.label).join('、')}`);
       sanitized.episodes = sanitized.episodes.map((item: Episode) => ({ ...item, durationSeconds: null, minDurationSeconds: 10, maxDurationSeconds: 30, parameters: Object.fromEntries(Object.entries(item.parameters || {}).filter(([key]) => model.params.some((param) => param.key === key && isTemplateControlledParam(param)))) }));
@@ -488,7 +475,7 @@ onMounted(() => { if (adminKey.value) void saveKey(); });
           </button>
         </aside>
         <section v-if="draft" class="editor">
-          <div class="editor-head"><div><div class="breadcrumbs">模板库 <span>/</span> {{ draft.id.startsWith('new-') ? '新建模板' : draft.slug }}</div><h2>{{ draft.title || '未命名模板' }}</h2></div><div class="editor-actions"><button class="danger-quiet" @click="removeTemplate">删除</button><button class="primary" :disabled="loading" @click="save">{{ loading ? '保存中…' : '保存更改' }}</button></div></div>
+          <div class="editor-head"><div><div class="breadcrumbs">模板库 <span>/</span> {{ draft.id.startsWith('new-') ? '新建模板' : draft.slug }}</div><h2>{{ draft.title || '未命名模板' }}</h2></div><div class="editor-actions"><button class="danger-quiet" @click="removeTemplate">删除</button><button class="primary" :disabled="loading || uploading" @click="save">{{ loading ? '保存中…' : '保存更改' }}</button></div></div>
           <div v-if="isCreating" class="create-type-tabs" role="tablist" aria-label="选择新建模板类型"><button :class="{ active: draft.type === 'SHORT_VIDEO' }" @click="selectCreateType('SHORT_VIDEO')">视频模板</button><button :class="{ active: draft.type === 'IMAGE_GENERATION' }" @click="selectCreateType('IMAGE_GENERATION')">图片模板</button></div>
           <div class="tabbar"><button class="tab active">{{ draft.type === 'SHORT_VIDEO' ? '视频模板信息' : '图片模板信息' }}</button><span class="spacer"></span><span class="saved-label">{{ draft.status }}</span></div>
           <div class="editor-content">
@@ -498,7 +485,8 @@ onMounted(() => { if (adminKey.value) void saveKey(); });
             </section>
             <section class="form-section episode-section"><div class="section-title"><div><h3>生成配置</h3><p>图片上传、画面比例和分辨率由客户端用户选择；其余必填参数由模板固定</p></div></div>
               <template v-if="currentEpisode">
-                <div class="form-grid episode-grid"><label>使用模型<select :value="currentEpisode.modelCode" @change="changeModel(($event.target as HTMLSelectElement).value)"><option disabled value="">选择数据库模型</option><option v-for="model in availableModels" :key="model.id" :value="model.code">{{ model.name }}</option></select></label><span></span><label class="span-2">生成提示词 <em class="required-mark">必填</em><textarea v-model="currentEpisode.promptTemplate" rows="4" placeholder="输入客户端生成时使用的模板提示词"></textarea></label><label class="span-2">负向提示词<textarea v-model="currentEpisode.negativePrompt" rows="2" placeholder="不希望生成的内容"></textarea></label></div>
+                <div class="form-grid"><label class="span-2 asset-field">预览视频或动图<div class="asset-drop" @dragover.prevent @drop="dropPreviewFile" @click="choosePreviewFile"><video v-if="currentPreview?.type === 'VIDEO'" :src="currentPreview.url" :poster="draft.coverUrl" controls playsinline preload="metadata" @click.stop /><img v-else-if="currentPreview" :src="currentPreview.url" alt="模板预览动图" /><span v-else>拖入视频、GIF 或 WebP，或点击上传</span></div><input :value="currentPreview?.url || ''" readonly placeholder="上传后显示 OSS 地址" /><button v-if="currentPreview" type="button" class="secondary" :disabled="uploading" @click="choosePreviewFile">更换预览</button><button v-if="currentPreview" type="button" class="danger-quiet" @click="currentEpisode.mediaAssets = []">移除预览</button><small>用于客户端展示，与封面和生成参考素材分别保存。</small></label></div>
+                <div class="form-grid episode-grid"><label>使用模型<select :value="currentEpisode.modelCode" @change="changeModel(($event.target as HTMLSelectElement).value)"><option disabled value="">选择数据库模型</option><option v-for="model in availableModels" :key="model.id" :value="model.code">{{ model.name }}</option></select></label><span></span><label class="span-2">生成提示词 <textarea v-model="currentEpisode.promptTemplate" rows="4" placeholder="输入客户端生成时使用的模板提示词"></textarea></label><label class="span-2">负向提示词<textarea v-model="currentEpisode.negativePrompt" rows="2" placeholder="不希望生成的内容"></textarea></label></div>
                 <div class="params-block"><div class="params-heading"><div><h4>模板控制的模型参数</h4><span>只展示当前模型除图片、画面比例、分辨率以外的参数</span></div><span class="param-count">{{ templateControlledParams.length }}</span></div><div v-for="param in templateControlledParams" :key="param.key" class="param-row"><div class="param-meta"><strong>{{ param.label }}</strong><em v-if="param.required">必填</em><code>{{ param.key }}</code><small v-if="param.description">{{ param.description }}</small></div><select v-if="param.type === 'SELECT'" v-model="currentEpisode.parameters[param.key]"><option disabled value="">请选择</option><option v-for="option in param.options" :key="option.value" :value="option.value">{{ option.label }}</option></select><select v-else-if="param.type === 'BOOLEAN'" v-model="currentEpisode.parameters[param.key]"><option :value="true">是</option><option :value="false">否</option></select><input v-else-if="param.type === 'NUMBER'" v-model.number="currentEpisode.parameters[param.key]" type="number" :min="param.min ?? undefined" :max="param.max ?? undefined" :placeholder="param.required ? '必填' : '可选'" /><input v-else v-model="currentEpisode.parameters[param.key]" :placeholder="param.required ? '必填' : '可选'" /></div><div v-if="!templateControlledParams.length" class="empty-params">当前模型没有需要由模板配置的参数。</div></div>
               </template>
             </section>

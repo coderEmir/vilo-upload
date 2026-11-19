@@ -20,6 +20,18 @@ pm2 start ecosystem.config.js --only vilo-template-remix-api --env production
 pm2 start ecosystem.config.js --only vilo-template-remix-worker --env production
 ```
 
+## 普通模板的封面、预览和生成素材
+
+普通“视频模板导入表”保留原有 13 列标题及顺序，追加可选的“预览视频或动图（可插入媒体）”列。封面图片和预览媒体分别锚定到对应数据行、对应列；预览支持视频、GIF、WebP，不需要填写外链。没有预览列的旧表仍可导入。
+
+“填写说明”页还可存放多条生成素材，表头为“模板标识、模板名称、素材用途、内嵌原文件”。模板标识对应主表唯一标识；素材用途为“生成参考视频”或“生成参考图”，文件锚定在“内嵌原文件”列。素材行按原顺序读取。内嵌视频通过内部媒体关系读取原文件，不会将其封面缩略图作为视频上传。
+
+每个内嵌文件通过 `POST /api/templates/assets` 原样上传 OSS，返回地址随后随模板创建请求保存：封面进入 `coverUrl`，预览进入默认内容配置的 `mediaAssets`，生成素材进入 `referenceAssets`。普通模板的空提示词保持空白，不补默认文案；模型编码仍必须填写后台有效模型。导入错误会显示对应数据行。
+
+模板编辑器也支持预览上传、播放、更换和移除；上传结束后点击保存。公开首页接口返回 `previewUrl` 和 `previewMimeType`，客户端卡片支持视频按需播放、动图展示，加载失败时回退封面。
+
+解析和上传请求测试：`npm run test:media`。
+
 ## 本地开发
 
 1. 在后端环境中配置至少 32 个字符的 `TEMPLATE_ADMIN_API_KEY`，启动 3010 模板服务、3020 主体替换服务；执行生成任务还需要启动主体替换任务进程。
