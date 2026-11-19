@@ -10,7 +10,7 @@ test('persists and displays each uploaded video before uploading the next; never
  const target={id:'t',title:'Test'};
  const input=new File(['i'],'template_video.mp4');
  const preview=new File(['r'],'result_video.mp4');
- const context={loading:ref(false),importing:ref(false),error:ref(''),notice:ref(''),visibleTemplates:ref([target]),draft:ref(null),
+ const context={loading:ref(false),importing:ref(false),error:ref(''),notice:ref(''),templates:ref([{...target,type:'SHORT_VIDEO'}]),draft:ref(null),
  planVideoBatch:()=>[{target,input,preview}],
  request:async(_,init)=>{const body=JSON.parse(init.body);calls.push(body.validateOnly?'validate':body.previewUrl?'save-preview':'save-input');return {template:{...target,episodes:[]}};},
  uploadAssetFile:async file=>{calls.push(file.name);return 'https://oss.example/'+file.name;},

@@ -46,8 +46,7 @@ async function importVideoDirectory(event: Event) {
   try {
     const manifest = files.find(file => file.name === 'manifest.json');
     const sources = manifest ? JSON.parse(await manifest.text()).items : [];
-    const plan = planVideoBatch(files, visibleTemplates.value, sources);
-    if (sources.length && plan.length !== sources.length) throw new Error(`目录视频组数 ${plan.length} 与清单模板数 ${sources.length} 不一致`);
+    const plan = planVideoBatch(files, templates.value.filter(item => item.type === 'SHORT_VIDEO'), sources);
     // Validate every match against the server before uploading any files.
     for (const item of plan) await request(`/templates/${encodeURIComponent(item.target.id)}/videos`, {
       method: 'PATCH', body: JSON.stringify({ validateOnly: true }),

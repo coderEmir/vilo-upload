@@ -28,3 +28,16 @@ test('video templates need no episodes and result video is optional', () => {
  const [job] = planVideoBatch([file('root/01_Test/template_video.mp4')], [{id:'t',slug:'t',title:'Test'}]);
  assert.equal(job.target.id,'t'); assert.equal(job.preview,undefined);
 });
+test('original single folder matches source ID even after template title changes, without manifest',()=>{
+ const [job]=planVideoBatch([file('01_Silly_Face_Dance/template_video.mp4')],[{id:'db-id',slug:'recast-recvxqZu2pVeTH',title:'搞怪舞蹈'}]);
+ assert.equal(job.target.id,'db-id');
+});
+test('manifest works when selecting only a template subfolder',()=>{
+ const [job]=planVideoBatch([file('01_Test/template_video.mp4')],[{id:'db',slug:'original-id',title:'已改名'}],[{id:'original-id',local:{template_video:'assets/01_Test/template_video.mp4'}}]);
+ assert.equal(job.target.id,'db');
+});
+test('number prefixes on stored titles normalize consistently without substring matching',()=>{
+ const [job]=planVideoBatch([file('01_Silly_Face_Dance/template_video.mp4')],[{id:'db',slug:'custom',title:'01_Silly Face Dance'}]);
+ assert.equal(job.target.id,'db');
+ assert.throws(()=>planVideoBatch([file('01_Silly_Face_Dance/template_video.mp4')],[{id:'db',slug:'custom',title:'Other Silly Face Dance Extra'}]),/0 个/);
+});
