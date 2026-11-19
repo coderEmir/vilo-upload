@@ -55,6 +55,7 @@ test('legacy workbook without embedded media keeps working', () => {
 test('WebP previews use image rendering even with missing or stale video metadata', () => {
   for (const metadata of [
     { type: 'VIDEO', mimeType: 'image/webp' },
+    { type: 'VIDEO', mimeType: 'video/mp4' },
     { type: 'VIDEO' },
     { mimeType: 'application/octet-stream' },
     { mimeType: 'IMAGE/WEBP; charset=binary' },

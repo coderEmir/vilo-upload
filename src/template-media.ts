@@ -27,8 +27,10 @@ export function previewMedia(assets: unknown[]): StoredMedia | undefined {
     const a = asset as StoredMedia;
     if (a.role === 'SOURCE_TEMPLATE' || typeof a.url !== 'string' || !a.url.trim()) continue;
     const declared = (a.mimeType || '').split(';')[0]!.trim().toLowerCase();
-    const mime = declared.startsWith('image/') || declared.startsWith('video/')
-      ? declared : mediaMime(a.url) || (a.type === 'VIDEO' ? 'video/mp4' : '');
+    // Legacy imports can label a WebP file as VIDEO/video/mp4. A recognized
+    // filename extension must win over stale database metadata in that case.
+    const mime = mediaMime(a.url) || (declared.startsWith('image/') || declared.startsWith('video/')
+      ? declared : a.type === 'VIDEO' ? 'video/mp4' : '');
     if (isPreviewMime(mime)) {
       const type = mime.startsWith('video/') ? 'VIDEO' : 'IMAGE';
       return a.mimeType === mime && a.type === type ? a : { ...a, mimeType: mime, type };

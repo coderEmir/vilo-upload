@@ -67,9 +67,14 @@ function openCatalogPreview(template: Template) {
 const selectedModel = computed(() => models.value.find((model) => model.code === currentEpisode.value?.modelCode));
 const visibleTemplates = computed(() => templates.value.filter((template) => template.type === activeType.value));
 const catalogPage = ref(1);
-const catalogPageSize = 10;
-const catalogPageCount = computed(() => Math.max(1, Math.ceil(visibleTemplates.value.length / catalogPageSize)));
-const pagedTemplates = computed(() => visibleTemplates.value.slice((catalogPage.value - 1) * catalogPageSize, catalogPage.value * catalogPageSize));
+const catalogPageSizes = [10, 20, 50, 100, 200, 500, 1000];
+const catalogPageSize = ref(10);
+const catalogPageCount = computed(() => Math.max(1, Math.ceil(visibleTemplates.value.length / catalogPageSize.value)));
+const pagedTemplates = computed(() => visibleTemplates.value.slice((catalogPage.value - 1) * catalogPageSize.value, catalogPage.value * catalogPageSize.value));
+watch(catalogPageSize, (size) => {
+  if (!catalogPageSizes.includes(size)) catalogPageSize.value = 10;
+  catalogPage.value = 1;
+}, { flush: 'sync' });
 const checkedTemplateIds = ref<string[]>([]);
 const bulkUpdating = ref(false);
 const allPageChecked = computed(() => pagedTemplates.value.length > 0 && pagedTemplates.value.every(item => checkedTemplateIds.value.includes(item.id)));
@@ -399,7 +404,7 @@ function selectTemplateById(id: string) {
   draft.value = structuredClone(toRaw(found));
   normalizeEpisodeModels();
   const index = visibleTemplates.value.findIndex((item) => item.id === found.id);
-  if (index >= 0) catalogPage.value = Math.floor(index / catalogPageSize) + 1;
+  if (index >= 0) catalogPage.value = Math.floor(index / catalogPageSize.value) + 1;
   if (draft.value.publishedAt) {
     const date = new Date(draft.value.publishedAt);
     const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
@@ -592,6 +597,7 @@ onMounted(() => { if (adminKey.value) void saveKey(); });
           </div>
           </div>
           <nav v-if="visibleTemplates.length" class="catalog-pagination" aria-label="模板列表分页">
+            <label class="catalog-page-size">每页 <select v-model.number="catalogPageSize" aria-label="每页模板数量"><option v-for="size in catalogPageSizes" :key="size" :value="size">{{ size }} 条</option></select></label>
             <span class="catalog-page-summary" aria-live="polite">共 {{ visibleTemplates.length }} 条，每页 {{ catalogPageSize }} 条</span>
             <div class="catalog-page-controls">
               <button type="button" class="secondary" :disabled="catalogPage <= 1" @click="catalogPage--">上一页</button>
