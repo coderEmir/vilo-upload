@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, toRaw, watch } from 'vue';
 import * as XLSX from 'xlsx';
-import { uploadTemplateFile, readTemplateEmbeddedMedia, isPreviewMime, storedMedia, previewMedia } from './template-media';
+import { readTemplateEmbeddedMedia, isPreviewMime, storedMedia, previewMedia } from './template-media';
+import { createTemplateUploader } from './template-upload-cache';
 import { mediaMime } from './remix-excel';
 import { normalizeAdminKey, verifyAdminKey, type AdminKeyStatus } from './admin-auth';
 import { modelMatchesTemplateType, resolveTemplateModel, type Model, type ModelParam, type TemplateType } from './template-models';
@@ -60,7 +61,9 @@ async function request(path: string, init: RequestInit = {}) {
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
-    throw new Error(payload?.error?.message || `请求失败 (${response.status})`);
+    const details = Array.isArray(payload?.error?.details)
+      ? payload.error.details.map((item: { path?: string; message?: string }) => `${item.path || ''} ${item.message || ''}`.trim()).join('、') : '';
+    throw new Error((payload?.error?.message || `请求失败 (${response.status})`) + (details ? `：${details}` : ''));
   }
   return response.status === 204 ? null : response.json();
 }
@@ -68,16 +71,16 @@ async function uploadAsset(file: File, assign: (url: string) => void) {
   if (!file.type.startsWith('image/')) { error.value = '封面必须是图片'; return; }
   uploading.value = true; error.value = '';
   try {
-    const response = await fetch(`${apiBase}/templates/assets`, { method: 'POST', body: file, headers: { 'Content-Type': file.type, 'x-template-admin-key': adminKey.value } });
-    const payload = await response.json().catch(() => null);
-    if (!response.ok) throw new Error(payload?.error?.message || `上传失败 (${response.status})`);
-    assign(payload.url);
+    assign(await uploadAssetFile(file));
     notice.value = '素材上传完成';
   } catch (e) { error.value = e instanceof Error ? e.message : '素材上传失败'; }
   finally { uploading.value = false; }
 }
+let assetCache: Storage | undefined;
+try { assetCache = localStorage; } catch { /* Uploads still deduplicate on the server. */ }
+const cachedUpload = createTemplateUploader(assetCache);
 async function uploadAssetFile(file: File): Promise<string> {
-  return uploadTemplateFile(file, apiBase, adminKey.value);
+  return cachedUpload(file, apiBase, adminKey.value);
 }
 function workbookTemplate() {
   const common = [
@@ -123,7 +126,7 @@ function downloadExcelTemplate() {
     ['封面可填写图片 URL，也可在 Excel 中将图片插入对应数据行。若两者同时提供，使用 URL。'],
     ['预览视频或动图列支持内嵌视频、GIF、WebP；预览上传 OSS 后写入 mediaAssets，生成素材单独写入 referenceAssets。'],
     ['填写说明页可用“模板标识、模板名称、素材用途、内嵌原文件”列保存多条生成素材，标识对应主表唯一标识。'],
-    ['来源没有生成提示词时保留空白，不补写；其他必填项按模型校验。若说明页含内嵌生成素材，请保留该页；请勿修改首个工作表已有列标题。'],
+    ['来源没有生成提示词时保留空白，不补写；必填提示词为空时校验失败，不会上传素材。整表通过前后端校验后才上传，成功上传的文件会在重试时复用。若说明页含内嵌生成素材，请保留该页；请勿修改首个工作表已有列标题。'],
   ]);
   XLSX.utils.book_append_sheet(workbook, help, '填写说明');
   XLSX.writeFile(workbook, `Vilo-${typeLabel.value}-模板导入表.xlsx`);
@@ -177,17 +180,25 @@ async function importExcel(event: Event) {
       }
       group.episodes.push(item);
     }
+    const prepared: Array<{ excelRow: number; validate: () => Promise<unknown>; execute: () => Promise<void> }> = [];
+    const slugs = new Set<string>();
     for (const group of groups.values()) {
       const row = group.row;
       const excelRow = group.excelRow;
       try {
+        const uploads: Array<() => Promise<void>> = [];
         let coverUrl = nonEmpty(row.coverUrl);
         if (coverUrl && !/^https?:\/\//i.test(coverUrl)) throw new Error('封面图列仅接受 http/https 图片链接；也可以留空并插入该行的图片');
         const image = imageRows.find((item) => item.row === excelRow) || group.episodes.map((episode) => imageRows.find((item) => item.row === episode.excelRow)).find(Boolean);
-        if (!coverUrl && image) coverUrl = await uploadAssetFile(image.file);
+        if (!coverUrl && image) {
+          coverUrl = 'https://pending.invalid/cover';
+          uploads.push(async () => { payload.coverUrl = await uploadAssetFile(image.file); });
+        }
         if (!coverUrl) throw new Error('封面图链接或图片必填');
         const title = nonEmpty(row.title), slug = nonEmpty(row.slug), category = nonEmpty(row.category), description = nonEmpty(row.description);
         if (!title || !slug || !category || !description) throw new Error('模板名称、唯一标识、分类、描述/生成提示词均必填');
+        if (slugs.has(slug)) throw new Error('表格中的模板唯一标识重复');
+        slugs.add(slug);
         const tags = nonEmpty(row.tags).split(/[,，]/).map((tag) => tag.trim()).filter(Boolean);
         const booleanValue = (value: unknown, fallback: boolean) => value === '' || value === undefined ? fallback : ['是', 'true', '1', 'yes', 'y'].includes(nonEmpty(value).toLowerCase());
         const episodes: Episode[] = [];
@@ -201,8 +212,8 @@ async function importExcel(event: Event) {
             if (!/^https?:\/\//i.test(previewUrl)) throw new Error('预览链接必须是 HTTP(S)');
             episode.mediaAssets = [storedMedia(previewUrl, mediaMime(previewUrl), 'PREVIEW')];
           }
-          for (const asset of previews) episode.mediaAssets.push(storedMedia(await uploadAssetFile(asset.file), asset.file.type, 'PREVIEW', asset.file.name));
-          for (const asset of references) episode.referenceAssets.push(storedMedia(await uploadAssetFile(asset.file), asset.file.type, 'INPUT', asset.file.name));
+          for (const asset of previews) uploads.push(async () => { episode.mediaAssets.push(storedMedia(await uploadAssetFile(asset.file), asset.file.type, 'PREVIEW', asset.file.name)); });
+          for (const asset of references) uploads.push(async () => { episode.referenceAssets.push(storedMedia(await uploadAssetFile(asset.file), asset.file.type, 'INPUT', asset.file.name)); });
         };
         if (activeType.value === 'COMIC_DRAMA') {
           if (new Set(group.episodes.map((episode) => Number(episode.row.episodeNumber))).size !== group.episodes.length) throw new Error('同一模板的剧集序号不能重复');
@@ -220,9 +231,11 @@ async function importExcel(event: Event) {
           const modelReference = nonEmpty(row.modelCode), promptTemplate = nonEmpty(row.promptTemplate);
           const model = resolveTemplateModel(models.value, modelReference, activeType.value);
           if (!model) throw new Error('有效模型编码或名称必填');
+          if (!promptTemplate) throw new Error('生成提示词必填，请补充后再导入');
           const parameters = Object.fromEntries(model.params.filter(isTemplateControlledParam).map((param) => {
             const imported = row[excelParamKey(param.key)];
             const value = hasParamValue(imported) ? imported : defaultParamValue(param);
+            if (!hasParamValue(value)) return [param.key, ''];
             if (param.type === 'NUMBER') return [param.key, Number(value)];
             if (param.type === 'BOOLEAN') return [param.key, ['是', 'true', '1', 'yes', 'y'].includes(nonEmpty(value).toLowerCase())];
             return [param.key, value];
@@ -235,14 +248,24 @@ async function importExcel(event: Event) {
           const source = activeType.value === 'COMIC_DRAMA' ? group.episodes[i] : group;
           await uploadRowMedia(source.excelRow, episodes[i], source.row);
         }
-        const sortOrder = Number(row.sortOrder) || 0;
+        const sortOrder = nonEmpty(row.sortOrder) ? Number(row.sortOrder) : 0;
         if (!Number.isInteger(sortOrder)) throw new Error('排序权重必须为整数');
         const status = nonEmpty(row.status).toUpperCase() || 'DRAFT';
         if (!['DRAFT', 'PUBLISHED', 'ARCHIVED'].includes(status)) throw new Error('状态仅支持 DRAFT、PUBLISHED、ARCHIVED');
         const payload = { slug, title, type: activeType.value, category, genreId: null, description, storyBackground: activeType.value === 'COMIC_DRAMA' && nonEmpty(row.storyBackground) ? JSON.parse(nonEmpty(row.storyBackground)) : {}, coverUrl, tags, audience: activeType.value === 'COMIC_DRAMA' ? nonEmpty(row.audience) || null : null, sourceMeta: null, status, premium: booleanValue(row.premium, false), active: booleanValue(row.active, true), sortOrder, publishedAt: new Date().toISOString(), episodes };
-        await request('/templates', { method: 'POST', body: JSON.stringify(payload) });
-        created++;
+        prepared.push({ excelRow, validate: () => request('/templates/validate', { method: 'POST', body: JSON.stringify(payload) }), execute: async () => {
+          for (const upload of uploads) await upload();
+          await request('/templates', { method: 'POST', body: JSON.stringify(payload) });
+        } });
       } catch (e) { failures.push(`第 ${excelRow} 行：${e instanceof Error ? e.message : '导入失败'}`); }
+    }
+    if (failures.length) throw new Error('校验失败，未上传任何素材：' + failures.join('；'));
+    for (const item of prepared) {
+      try { await item.validate(); } catch (e) { failures.push('第 ' + item.excelRow + ' 行：' + (e instanceof Error ? e.message : '后端校验失败')); }
+    }
+    if (failures.length) throw new Error('校验失败，未上传任何素材：' + failures.join('；'));
+    for (const item of prepared) {
+      try { await item.execute(); created++; } catch (e) { failures.push('第 ' + item.excelRow + ' 行：' + (e instanceof Error ? e.message : '导入失败')); }
     }
     await load();
     if (failures.length) {
