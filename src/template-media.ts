@@ -22,7 +22,19 @@ export function storedMedia(url: string, mimeType: string, role: 'PREVIEW' | 'IN
   return { type: mimeType.startsWith('video/') ? 'VIDEO' : 'IMAGE', role: role === 'PREVIEW' ? 'RESULT' : 'SOURCE_TEMPLATE', url, mimeType, ...(name ? { name } : {}) };
 }
 export function previewMedia(assets: unknown[]): StoredMedia | undefined {
-  return assets.find((a): a is StoredMedia => !!a && typeof a === 'object' && (a as StoredMedia).role !== 'SOURCE_TEMPLATE' && typeof (a as StoredMedia).url === 'string' && isPreviewMime((a as StoredMedia).mimeType || ((a as StoredMedia).type === 'VIDEO' ? 'video/mp4' : mediaMime((a as StoredMedia).url))));
+  for (const asset of assets) {
+    if (!asset || typeof asset !== 'object') continue;
+    const a = asset as StoredMedia;
+    if (a.role === 'SOURCE_TEMPLATE' || typeof a.url !== 'string' || !a.url.trim()) continue;
+    const declared = (a.mimeType || '').split(';')[0]!.trim().toLowerCase();
+    const mime = declared.startsWith('image/') || declared.startsWith('video/')
+      ? declared : mediaMime(a.url) || (a.type === 'VIDEO' ? 'video/mp4' : '');
+    if (isPreviewMime(mime)) {
+      const type = mime.startsWith('video/') ? 'VIDEO' : 'IMAGE';
+      return a.mimeType === mime && a.type === type ? a : { ...a, mimeType: mime, type };
+    }
+  }
+  return undefined;
 }
 
 /** Resolve media by cell and role; never treat an input or preview poster as a cover. */

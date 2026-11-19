@@ -3,6 +3,7 @@ import { computed, onMounted, ref, toRaw, watch } from 'vue';
 import * as XLSX from 'xlsx';
 import { readTemplateEmbeddedMedia, isPreviewMime, storedMedia, previewMedia } from './template-media';
 import { createTemplateUploader } from './template-upload-cache';
+import { updateTemplateStatuses, type BulkStatus } from './template-bulk-status';
 import { mediaMime } from './remix-excel';
 import { normalizeAdminKey, verifyAdminKey, type AdminKeyStatus } from './admin-auth';
 import { modelMatchesTemplateType, resolveTemplateModel, type Model, type ModelParam, type TemplateType } from './template-models';
@@ -35,8 +36,84 @@ const importing = ref(false);
 const importInput = ref<HTMLInputElement | null>(null);
 const currentEpisode = computed(() => draft.value?.episodes[activeEpisode.value]);
 const currentPreview = computed(() => previewMedia(currentEpisode.value?.mediaAssets || []));
+const imagePreviewDialog = ref<HTMLDialogElement | null>(null);
+const imagePreviewUrl = ref('');
+const imagePreviewTitle = ref('');
+const imagePreviewFailed = ref(false);
+const imagePreviewType = ref<'IMAGE' | 'VIDEO'>('IMAGE');
+const imagePreviewPoster = ref('');
+function openImagePreview(url: string, title: string) {
+  openMediaPreview(url, title, 'IMAGE');
+}
+function openMediaPreview(url: string, title: string, type: 'IMAGE' | 'VIDEO', poster = '') {
+  if (!url) return;
+  imagePreviewUrl.value = url;
+  imagePreviewTitle.value = title;
+  imagePreviewType.value = type;
+  imagePreviewPoster.value = poster;
+  imagePreviewFailed.value = false;
+  imagePreviewDialog.value?.showModal();
+}
+function catalogPreview(template: Template) {
+  return previewMedia(template.episodes[0]?.mediaAssets || []);
+}
+function catalogImageUrl(template: Template): string {
+  return catalogPreview(template)?.url || template.coverUrl;
+}
+function openCatalogPreview(template: Template) {
+  const preview = catalogPreview(template);
+  openMediaPreview(preview?.url || template.coverUrl, template.title, preview?.type || 'IMAGE', template.coverUrl);
+}
 const selectedModel = computed(() => models.value.find((model) => model.code === currentEpisode.value?.modelCode));
 const visibleTemplates = computed(() => templates.value.filter((template) => template.type === activeType.value));
+const catalogPage = ref(1);
+const catalogPageSize = 10;
+const catalogPageCount = computed(() => Math.max(1, Math.ceil(visibleTemplates.value.length / catalogPageSize)));
+const pagedTemplates = computed(() => visibleTemplates.value.slice((catalogPage.value - 1) * catalogPageSize, catalogPage.value * catalogPageSize));
+const checkedTemplateIds = ref<string[]>([]);
+const bulkUpdating = ref(false);
+const allPageChecked = computed(() => pagedTemplates.value.length > 0 && pagedTemplates.value.every(item => checkedTemplateIds.value.includes(item.id)));
+const somePageChecked = computed(() => !allPageChecked.value && pagedTemplates.value.some(item => checkedTemplateIds.value.includes(item.id)));
+function togglePageSelection() {
+  if (bulkUpdating.value) return;
+  const ids = new Set(checkedTemplateIds.value);
+  for (const item of pagedTemplates.value) {
+    if (allPageChecked.value) ids.delete(item.id); else ids.add(item.id);
+  }
+  checkedTemplateIds.value = [...ids];
+}
+watch(activeType, () => { checkedTemplateIds.value = []; }, { flush: 'sync' });
+watch(visibleTemplates, (items) => {
+  const ids = new Set(items.map(item => item.id));
+  checkedTemplateIds.value = checkedTemplateIds.value.filter(id => ids.has(id));
+});
+async function bulkSetStatus(status: BulkStatus) {
+  if (bulkUpdating.value || loading.value) return;
+  const ids = new Set(checkedTemplateIds.value);
+  const targets = visibleTemplates.value.filter(item => ids.has(item.id));
+  if (!targets.length) return;
+  bulkUpdating.value = true; loading.value = true; error.value = ''; notice.value = '';
+  try {
+    const result = await updateTemplateStatuses(targets, status, request);
+    for (const updated of result.succeeded) {
+      const item = templates.value.find(item => item.id === updated.id);
+      if (item) { item.status = updated.status; item.publishedAt = updated.publishedAt; }
+      if (draft.value?.id === updated.id) {
+        draft.value.status = updated.status;
+        if (!draft.value.publishedAt && updated.publishedAt) {
+          const date = new Date(updated.publishedAt);
+          draft.value.publishedAt = new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+        }
+      }
+    }
+    const succeeded = new Set(result.succeeded.map(item => item.id));
+    checkedTemplateIds.value = checkedTemplateIds.value.filter(id => !succeeded.has(id));
+    if (result.succeeded.length) notice.value = `已将 ${result.succeeded.length} 个模板设为${status === 'PUBLISHED' ? '已发布' : '草稿'}`;
+    if (result.failed.length) error.value = `${result.failed.length} 个模板修改失败，已保留勾选，可重试：${result.failed.map(item => `${item.title}：${item.message}`).join('；')}`;
+  } finally { bulkUpdating.value = false; loading.value = false; }
+}
+watch(activeType, () => { catalogPage.value = 1; }, { flush: 'sync' });
+watch(catalogPageCount, (pages) => { catalogPage.value = Math.min(catalogPage.value, pages); }, { flush: 'sync' });
 const isComicDrama = computed(() => draft.value?.type === 'COMIC_DRAMA' || draft.value?.type === 'MV');
 const typeLabel = computed(() => activeType.value === 'COMIC_DRAMA' ? '漫剧' : activeType.value === 'SHORT_VIDEO' ? '视频' : '图片');
 const availableModels = computed(() => models.value.filter((model) => modelMatchesTemplateType(model, activeType.value)));
@@ -321,6 +398,8 @@ function selectTemplateById(id: string) {
   selectedId.value = found.id;
   draft.value = structuredClone(toRaw(found));
   normalizeEpisodeModels();
+  const index = visibleTemplates.value.findIndex((item) => item.id === found.id);
+  if (index >= 0) catalogPage.value = Math.floor(index / catalogPageSize) + 1;
   if (draft.value.publishedAt) {
     const date = new Date(draft.value.publishedAt);
     const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
@@ -490,12 +569,36 @@ onMounted(() => { if (adminKey.value) void saveKey(); });
           <div class="catalog-header"><span>{{ activeType === 'SHORT_VIDEO' ? '视频' : '图片' }}模板</span><span class="count">{{ visibleTemplates.length }}</span></div>
           <div class="excel-actions"><button type="button" class="secondary" @click="downloadExcelTemplate">下载 Excel 模板</button><button type="button" class="secondary" :disabled="importing" @click="importInput?.click()">{{ importing ? '正在导入…' : '导入 Excel' }}</button><input ref="importInput" type="file" accept=".xlsx,.xls" hidden @change="importExcel" /></div>
           <div class="search-row"><span>⌕</span><input placeholder="搜索模板" /></div>
+          <div v-if="visibleTemplates.length" class="catalog-bulk-actions">
+            <div class="catalog-bulk-selection">
+              <label><input type="checkbox" :checked="allPageChecked" :indeterminate="somePageChecked" :disabled="loading" @change="togglePageSelection" />全选当前页</label>
+              <span>已选 {{ checkedTemplateIds.length }} 项</span>
+            </div>
+            <div class="catalog-bulk-links"><button type="button" :disabled="loading" @click="checkedTemplateIds = visibleTemplates.map(item => item.id)">选择全部 {{ visibleTemplates.length }} 项</button><button type="button" :disabled="loading || !checkedTemplateIds.length" @click="checkedTemplateIds = []">清空</button></div>
+            <div class="catalog-bulk-buttons"><button type="button" class="primary" :disabled="loading || !checkedTemplateIds.length" @click="bulkSetStatus('PUBLISHED')">批量发布</button><button type="button" class="secondary" :disabled="loading || !checkedTemplateIds.length" @click="bulkSetStatus('DRAFT')">批量设为草稿</button></div>
+            <span v-if="bulkUpdating" class="catalog-bulk-progress" role="status">正在更新模板状态…</span>
+          </div>
           <div v-if="!visibleTemplates.length" class="empty-list">{{ loading ? '正在加载…' : '暂无模板' }}</div>
-          <button v-for="item in visibleTemplates" :key="item.id" type="button" class="template-row" :class="{ selected: selectedId === item.id }" @click="openTemplate(item)">
-            <img :src="item.coverUrl || 'https://images.unsplash.com/photo-1519608487953-e999c86e7455?w=300'" alt="" />
+          <div class="catalog-items">
+          <div v-for="item in pagedTemplates" :key="item.id" class="catalog-template">
+          <input v-model="checkedTemplateIds" type="checkbox" class="catalog-row-checkbox" :value="item.id" :aria-label="`选择模板 ${item.title}`" :disabled="loading" />
+          <button type="button" class="template-row" :class="{ selected: selectedId === item.id }" @click="openTemplate(item)">
+            <video v-if="catalogPreview(item)?.type === 'VIDEO'" :src="catalogImageUrl(item)" :poster="item.coverUrl" muted playsinline preload="none" aria-label="点击播放预览视频" @click.stop="openCatalogPreview(item)" />
+            <img v-else :src="catalogImageUrl(item)" alt="" loading="lazy" @click.stop="openCatalogPreview(item)" />
             <span class="row-copy"><strong>{{ item.title }}</strong><small>{{ item.category || '未分类' }}<template v-if="item.type === 'COMIC_DRAMA' || item.type === 'MV'"> · {{ item.episodes.length }} 集</template></small></span>
             <span class="status-dot" :class="item.status.toLowerCase()" :title="item.status"></span>
           </button>
+          <button v-if="catalogImageUrl(item)" type="button" class="catalog-preview-trigger" :aria-label="`预览 ${item.title} 的素材`" @click="openCatalogPreview(item)">{{ catalogPreview(item)?.type === 'VIDEO' ? '播放' : '预览' }}</button>
+          </div>
+          </div>
+          <nav v-if="visibleTemplates.length" class="catalog-pagination" aria-label="模板列表分页">
+            <span class="catalog-page-summary" aria-live="polite">共 {{ visibleTemplates.length }} 条，每页 {{ catalogPageSize }} 条</span>
+            <div class="catalog-page-controls">
+              <button type="button" class="secondary" :disabled="catalogPage <= 1" @click="catalogPage--">上一页</button>
+              <span aria-live="polite">{{ catalogPage }} / {{ catalogPageCount }}</span>
+              <button type="button" class="secondary" :disabled="catalogPage >= catalogPageCount" @click="catalogPage++">下一页</button>
+            </div>
+          </nav>
         </aside>
         <section v-if="draft" class="editor">
           <div class="editor-head"><div><div class="breadcrumbs">模板库 <span>/</span> {{ draft.id.startsWith('new-') ? '新建模板' : draft.slug }}</div><h2>{{ draft.title || '未命名模板' }}</h2></div><div class="editor-actions"><button class="danger-quiet" @click="removeTemplate">删除</button><button class="primary" :disabled="loading || uploading" @click="save">{{ loading ? '保存中…' : '保存更改' }}</button></div></div>
@@ -503,12 +606,12 @@ onMounted(() => { if (adminKey.value) void saveKey(); });
           <div class="tabbar"><button class="tab active">{{ draft.type === 'SHORT_VIDEO' ? '视频模板信息' : '图片模板信息' }}</button><span class="spacer"></span><span class="saved-label">{{ draft.status }}</span></div>
           <div class="editor-content">
             <section class="form-section"><div class="section-title"><div><h3>基本信息</h3><p>模板在客户端展示的名称、分类和封面</p></div></div>
-              <div class="form-grid"><label>模板名称<input v-model="draft.title" maxlength="200" placeholder="输入模板名称" /></label><label>唯一标识<input v-model="draft.slug" maxlength="160" placeholder="例如: neon-dream" /></label><label>类型<input :value="draft.type === 'SHORT_VIDEO' ? '视频' : '图片'" readonly /></label><label>分类<input v-model="draft.category" placeholder="例如：科幻 / 爱情" /></label><label class="span-2 asset-field">封面图<div class="asset-drop" @dragover.prevent @drop="handleDrop($event, (url) => draft!.coverUrl = url)" @click="chooseFile((url) => draft!.coverUrl = url)"><img v-if="draft.coverUrl" :src="draft.coverUrl" alt="封面预览" /><span v-else>拖拽图片到这里，或点击上传</span></div><input :value="draft.coverUrl" readonly placeholder="上传完成后显示阿里云链接" /></label><label class="span-2">模板描述<textarea v-model="draft.description" rows="3" placeholder="用于模板目录展示的简介" /></label><label>状态<select v-model="draft.status"><option value="DRAFT">草稿</option><option value="PUBLISHED">已发布</option><option value="ARCHIVED">已归档</option></select></label><label>标签<input :value="draft.tags.join(', ')" placeholder="逗号分隔" @input="draft.tags = ($event.target as HTMLInputElement).value.split(',').map((tag) => tag.trim()).filter(Boolean)" /></label></div>
+              <div class="form-grid"><label>模板名称<input v-model="draft.title" maxlength="200" placeholder="输入模板名称" /></label><label>唯一标识<input v-model="draft.slug" maxlength="160" placeholder="例如: neon-dream" /></label><label>类型<input :value="draft.type === 'SHORT_VIDEO' ? '视频' : '图片'" readonly /></label><label>分类<input v-model="draft.category" placeholder="例如：科幻 / 爱情" /></label><label class="span-2 asset-field">封面图<div class="asset-drop" @dragover.prevent @drop="handleDrop($event, (url) => draft!.coverUrl = url)" @click="chooseFile((url) => draft!.coverUrl = url)"><img v-if="draft.coverUrl" :src="draft.coverUrl" alt="封面预览" title="点击预览原图" @click.stop="openImagePreview(draft.coverUrl, draft.title + ' · 封面')" /><span v-else>拖拽图片到这里，或点击上传</span></div><button v-if="draft.coverUrl" type="button" class="secondary" @click.prevent="openImagePreview(draft.coverUrl, draft.title + ' · 封面')">查看原图</button><input :value="draft.coverUrl" readonly placeholder="上传完成后显示阿里云链接" /></label><label class="span-2">模板描述<textarea v-model="draft.description" rows="3" placeholder="用于模板目录展示的简介" /></label><label>状态<select v-model="draft.status"><option value="DRAFT">草稿</option><option value="PUBLISHED">已发布</option><option value="ARCHIVED">已归档</option></select></label><label>标签<input :value="draft.tags.join(', ')" placeholder="逗号分隔" @input="draft.tags = ($event.target as HTMLInputElement).value.split(',').map((tag) => tag.trim()).filter(Boolean)" /></label></div>
               <div class="switch-row"><label><input v-model="draft.active" type="checkbox" /> 启用模板</label><label><input v-model="draft.premium" type="checkbox" /> 付费模板</label><label>排序权重 <input v-model.number="draft.sortOrder" type="number" class="short-input" /></label></div>
             </section>
             <section class="form-section episode-section"><div class="section-title"><div><h3>生成配置</h3><p>图片上传、画面比例和分辨率由客户端用户选择；其余必填参数由模板固定</p></div></div>
               <template v-if="currentEpisode">
-                <div class="form-grid"><label class="span-2 asset-field">预览视频或动图<div class="asset-drop" @dragover.prevent @drop="dropPreviewFile" @click="choosePreviewFile"><video v-if="currentPreview?.type === 'VIDEO'" :src="currentPreview.url" :poster="draft.coverUrl" controls playsinline preload="metadata" @click.stop /><img v-else-if="currentPreview" :src="currentPreview.url" alt="模板预览动图" /><span v-else>拖入视频、GIF 或 WebP，或点击上传</span></div><input :value="currentPreview?.url || ''" readonly placeholder="上传后显示 OSS 地址" /><button v-if="currentPreview" type="button" class="secondary" :disabled="uploading" @click="choosePreviewFile">更换预览</button><button v-if="currentPreview" type="button" class="danger-quiet" @click="currentEpisode.mediaAssets = []">移除预览</button><small>用于客户端展示，与封面和生成参考素材分别保存。</small></label></div>
+                <div class="form-grid"><label class="span-2 asset-field">预览视频或动图<div class="asset-drop" @dragover.prevent @drop="dropPreviewFile" @click="choosePreviewFile"><video v-if="currentPreview?.type === 'VIDEO'" :src="currentPreview.url" :poster="draft.coverUrl" controls playsinline preload="metadata" @click.stop /><img v-else-if="currentPreview" :src="currentPreview.url" alt="模板预览动图" title="点击预览原图或动图" @click.stop="openImagePreview(currentPreview.url, draft.title + ' · 预览')" /><span v-else>拖入视频、GIF 或 WebP，或点击上传</span></div><button v-if="currentPreview?.type === 'IMAGE'" type="button" class="secondary" @click.prevent="openImagePreview(currentPreview.url, draft.title + ' · 预览')">查看原图或动图</button><button v-if="currentPreview?.type === 'VIDEO'" type="button" class="secondary" @click.prevent="openMediaPreview(currentPreview.url, draft.title + ' · 预览视频', 'VIDEO', draft.coverUrl)">放大播放</button><input :value="currentPreview?.url || ''" readonly placeholder="上传后显示 OSS 地址" /><button v-if="currentPreview" type="button" class="secondary" :disabled="uploading" @click="choosePreviewFile">更换预览</button><button v-if="currentPreview" type="button" class="danger-quiet" @click="currentEpisode.mediaAssets = []">移除预览</button><small>用于客户端展示，与封面和生成参考素材分别保存。</small></label></div>
                 <div class="form-grid episode-grid"><label>使用模型<select :value="currentEpisode.modelCode" @change="changeModel(($event.target as HTMLSelectElement).value)"><option disabled value="">选择数据库模型</option><option v-for="model in availableModels" :key="model.id" :value="model.code">{{ model.name }}</option></select></label><span></span><label class="span-2">生成提示词 <textarea v-model="currentEpisode.promptTemplate" rows="4" placeholder="输入客户端生成时使用的模板提示词"></textarea></label><label class="span-2">负向提示词<textarea v-model="currentEpisode.negativePrompt" rows="2" placeholder="不希望生成的内容"></textarea></label></div>
                 <div class="params-block"><div class="params-heading"><div><h4>模板控制的模型参数</h4><span>只展示当前模型除图片、画面比例、分辨率以外的参数</span></div><span class="param-count">{{ templateControlledParams.length }}</span></div><div v-for="param in templateControlledParams" :key="param.key" class="param-row"><div class="param-meta"><strong>{{ param.label }}</strong><em v-if="param.required">必填</em><code>{{ param.key }}</code><small v-if="param.description">{{ param.description }}</small></div><select v-if="param.type === 'SELECT'" v-model="currentEpisode.parameters[param.key]"><option disabled value="">请选择</option><option v-for="option in param.options" :key="option.value" :value="option.value">{{ option.label }}</option></select><select v-else-if="param.type === 'BOOLEAN'" v-model="currentEpisode.parameters[param.key]"><option :value="true">是</option><option :value="false">否</option></select><input v-else-if="param.type === 'NUMBER'" v-model.number="currentEpisode.parameters[param.key]" type="number" :min="param.min ?? undefined" :max="param.max ?? undefined" :placeholder="param.required ? '必填' : '可选'" /><input v-else v-model="currentEpisode.parameters[param.key]" :placeholder="param.required ? '必填' : '可选'" /></div><div v-if="!templateControlledParams.length" class="empty-params">当前模型没有需要由模板配置的参数。</div></div>
               </template>
@@ -519,6 +622,12 @@ onMounted(() => { if (adminKey.value) void saveKey(); });
       </div>
     </main>
     <RemixWorkspace v-else :admin-key="adminKey" />
+    <dialog ref="imagePreviewDialog" class="image-preview-dialog" aria-labelledby="image-preview-title" @close="imagePreviewUrl = ''" @click="($event.target === imagePreviewDialog) && imagePreviewDialog?.close()">
+      <div class="image-preview-header"><h2 id="image-preview-title">{{ imagePreviewTitle }}</h2><button type="button" class="secondary" autofocus @click="imagePreviewDialog?.close()">关闭</button></div>
+      <p v-if="imagePreviewFailed" class="image-preview-error">素材加载失败，请检查素材地址、访问权限或浏览器支持的格式。</p>
+      <video v-else-if="imagePreviewUrl && imagePreviewType === 'VIDEO'" :key="imagePreviewUrl" :src="imagePreviewUrl" :poster="imagePreviewPoster" :aria-label="imagePreviewTitle" controls autoplay playsinline preload="metadata" @error="imagePreviewFailed = true" />
+      <img v-else-if="imagePreviewUrl" :key="imagePreviewUrl" :src="imagePreviewUrl" :alt="imagePreviewTitle" @error="imagePreviewFailed = true" />
+    </dialog>
     <footer><span>VILO STUDIO <i></i> CONTENT SYSTEM</span><label>API 管理密钥 <input v-model="adminKey" type="password" autocomplete="off" placeholder="输入管理密钥" @keyup.enter="saveKey" /><button type="button" class="secondary" :disabled="adminKeyStatus === 'checking'" @click="saveKey">{{ adminKeyStatus === 'checking' ? '验证中…' : '验证并保存' }}</button><small>{{ keyCacheError || (adminKey ? (adminKeyStatus === 'valid' ? '已缓存 · 已验证' : '已缓存到本浏览器') : '清空输入将清除缓存') }}</small></label><span>API {{ workspaceMode === 'templates' ? apiBase : remixApiBase }}</span></footer>
   </div>
 </template>

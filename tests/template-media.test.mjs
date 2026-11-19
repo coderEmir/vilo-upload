@@ -52,6 +52,34 @@ test('legacy workbook without embedded media keeps working', () => {
   const data = XLSX.write(book, { type: 'array', bookType: 'xlsx' });
   assert.deepEqual(readTemplateEmbeddedMedia(data, book, '视频'), []);
 });
+test('WebP previews use image rendering even with missing or stale video metadata', () => {
+  for (const metadata of [
+    { type: 'VIDEO', mimeType: 'image/webp' },
+    { type: 'VIDEO' },
+    { mimeType: 'application/octet-stream' },
+    { mimeType: 'IMAGE/WEBP; charset=binary' },
+  ]) {
+    const asset = { url: 'https://oss.example/preview.WEBP?signature=abc', role: 'RESULT', ...metadata };
+    const result = previewMedia([asset]);
+    assert.equal(result.type, 'IMAGE');
+    assert.equal(result.mimeType, 'image/webp');
+    assert.equal(result.url, asset.url);
+  }
+  assert.equal(previewMedia([{ url: 'https://oss.example/input.webp', role: 'SOURCE_TEMPLATE' }]), undefined);
+});
+test('video and animated GIF previews retain playable types with signed URLs or MIME-only formats', () => {
+  for (const [asset, type, mime] of [
+    [{ url: 'https://oss.example/preview.MP4?signature=x' }, 'VIDEO', 'video/mp4'],
+    [{ url: 'https://oss.example/preview.GIF?signature=x', type: 'VIDEO' }, 'IMAGE', 'image/gif'],
+    [{ url: 'https://oss.example/object', mimeType: 'image/webp' }, 'IMAGE', 'image/webp'],
+    [{ url: 'https://oss.example/object', mimeType: 'video/webm', type: 'IMAGE' }, 'VIDEO', 'video/webm'],
+  ]) {
+    const result = previewMedia([{ ...asset, role: 'RESULT' }]);
+    assert.equal(result.type, type);
+    assert.equal(result.mimeType, mime);
+    assert.equal(result.url, asset.url);
+  }
+});
 test('preview upload sends original bytes and MIME to the OSS asset endpoint before serialization', async () => {
   for (const mime of ['video/mp4', 'image/gif', 'image/webp']) {
     const file = new File([new Uint8Array([3, 9, 2, 7])], 'original', { type: mime });
