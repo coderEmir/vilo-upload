@@ -7,6 +7,8 @@ import { updateTemplateStatuses, type BulkStatus } from './template-bulk-status'
 import { mediaMime } from './remix-excel';
 import { normalizeAdminKey, verifyAdminKey, type AdminKeyStatus } from './admin-auth';
 import { modelMatchesTemplateType, resolveTemplateModel, type Model, type ModelParam, type TemplateType } from './template-models';
+import { webpFallbackUrl } from './image-preview';
+import { planVideoBatch } from './template-video-batch';
 import RemixWorkspace from './RemixWorkspace.vue';
 
 type Episode = { id?: string; number: number; title: string; synopsis: string; storyBeat: unknown; durationSeconds: number | null; minDurationSeconds: number; maxDurationSeconds: number; mediaAssets: unknown[]; referenceAssets: unknown[]; agents: unknown[]; promptTemplate: string; negativePrompt: string | null; defaultParams: Record<string, unknown> | null; premium: boolean; active: boolean; modelCode: string; parameters: Record<string, unknown> };
@@ -34,6 +36,52 @@ const error = ref('');
 const uploading = ref(false);
 const importing = ref(false);
 const importInput = ref<HTMLInputElement | null>(null);
+const videoDirectoryInput = ref<HTMLInputElement | null>(null);
+async function importVideoDirectory(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const files = Array.from(input.files || []); input.value = '';
+  if (!files.length) return;
+  loading.value = true; importing.value = true; error.value = ''; notice.value = '';
+  let completed = 0;
+  try {
+    const manifest = files.find(file => file.name === 'manifest.json');
+    const sources = manifest ? JSON.parse(await manifest.text()).items : [];
+    const plan = planVideoBatch(files, visibleTemplates.value, sources);
+    if (sources.length && plan.length !== sources.length) throw new Error(`目录视频组数 ${plan.length} 与清单模板数 ${sources.length} 不一致`);
+    // Validate every match against the server before uploading any files.
+    for (const item of plan) await request(`/templates/${encodeURIComponent(item.target.id)}/videos`, {
+      method: 'PATCH', body: JSON.stringify({ validateOnly: true }),
+    });
+    const failures: string[] = [];
+    for (const item of plan) {
+      try {
+        notice.value = `正在更新视频 ${completed + failures.length + 1}/${plan.length}：${item.target.title}`;
+        const inputUrl = await uploadAssetFile(new File([item.input], item.input.name, { type: 'video/mp4' }));
+        const commit = async (previewUrl?: string) => {
+        const result = await request(`/templates/${encodeURIComponent(item.target.id)}/videos`, { method: 'PATCH', body: JSON.stringify({ inputUrl, ...(previewUrl ? { previewUrl } : {}) }) });
+        if (result?.template) {
+          const updated = upsertLocalTemplate(result.template);
+          if (draft.value?.id === updated.id) {
+            const saved = updated.episodes[0];
+            const editing = draft.value.episodes[0];
+            if (editing && saved) { editing.referenceAssets = saved.referenceAssets; editing.mediaAssets = saved.mediaAssets; }
+            else draft.value.episodes = structuredClone(toRaw(updated.episodes));
+          }
+        }
+        };
+        await commit(); // Display the input immediately, even if preview upload later fails.
+        if (item.preview) {
+          const previewUrl = await uploadAssetFile(new File([item.preview], item.preview.name, { type: 'video/mp4' }));
+          await commit(previewUrl);
+        }
+        completed++;
+      } catch (e) { failures.push(`${item.target.title}：${e instanceof Error ? e.message : '更新失败'}`); }
+    }
+    notice.value = `已更新 ${completed}/${plan.length} 个模板的视频素材`;
+    if (failures.length) error.value = failures.join('；') + '。可重新选择目录重试，已上传素材将复用。';
+  } catch (e) { error.value = e instanceof Error ? e.message : '视频批量更新失败'; }
+  finally { loading.value = false; importing.value = false; }
+}
 const currentEpisode = computed(() => draft.value?.episodes[activeEpisode.value]);
 const currentPreview = computed(() => previewMedia(currentEpisode.value?.mediaAssets || []));
 const imagePreviewDialog = ref<HTMLDialogElement | null>(null);
@@ -42,6 +90,18 @@ const imagePreviewTitle = ref('');
 const imagePreviewFailed = ref(false);
 const imagePreviewType = ref<'IMAGE' | 'VIDEO'>('IMAGE');
 const imagePreviewPoster = ref('');
+const failedImageSources = new WeakMap<HTMLImageElement, string>();
+function handleImageError(event: Event, modal = false) {
+  const image = event.target as HTMLImageElement;
+  const source = image.getAttribute('src') || '';
+  const fallback = webpFallbackUrl(source);
+  if (fallback && failedImageSources.get(image) !== source) {
+    failedImageSources.set(image, fallback);
+    image.src = fallback;
+    return;
+  }
+  if (modal) imagePreviewFailed.value = true;
+}
 function openImagePreview(url: string, title: string) {
   openMediaPreview(url, title, 'IMAGE');
 }
@@ -337,7 +397,8 @@ async function importExcel(event: Event) {
         const payload = { slug, title, type: activeType.value, category, genreId: null, description, storyBackground: activeType.value === 'COMIC_DRAMA' && nonEmpty(row.storyBackground) ? JSON.parse(nonEmpty(row.storyBackground)) : {}, coverUrl, tags, audience: activeType.value === 'COMIC_DRAMA' ? nonEmpty(row.audience) || null : null, sourceMeta: null, status, premium: booleanValue(row.premium, false), active: booleanValue(row.active, true), sortOrder, publishedAt: new Date().toISOString(), episodes };
         prepared.push({ excelRow, validate: () => request('/templates/validate', { method: 'POST', body: JSON.stringify(payload) }), execute: async () => {
           for (const upload of uploads) await upload();
-          await request('/templates', { method: 'POST', body: JSON.stringify(payload) });
+          const result = await request('/templates', { method: 'POST', body: JSON.stringify(payload) });
+          if (result?.template) upsertLocalTemplate(result.template);
         } });
       } catch (e) { failures.push(`第 ${excelRow} 行：${e instanceof Error ? e.message : '导入失败'}`); }
     }
@@ -349,7 +410,6 @@ async function importExcel(event: Event) {
     for (const item of prepared) {
       try { await item.execute(); created++; } catch (e) { failures.push('第 ' + item.excelRow + ' 行：' + (e instanceof Error ? e.message : '导入失败')); }
     }
-    await load();
     if (failures.length) {
       error.value = `已导入 ${created} 行，${failures.length} 行失败：${failures.join('；')}`;
       if (created) notice.value = `成功创建 ${created} 个${typeLabel.value}模板`;
@@ -386,6 +446,17 @@ function choosePreviewFile() {
 }
 function dropPreviewFile(event: DragEvent) {
   event.preventDefault(); void uploadPreviewFile(event.dataTransfer?.files?.[0]);
+}
+function upsertLocalTemplate(raw: Template): Template {
+  const item = { ...raw, marketScore: Number(raw.marketScore), episodes: (raw.episodes || []).map(episode => {
+    const stored = episode.defaultParams || {};
+    const parameters = stored.parameters && typeof stored.parameters === 'object' ? stored.parameters as Record<string, unknown>
+      : Object.fromEntries(Object.entries(stored).filter(([key]) => !['modelCode', 'parameters'].includes(key)));
+    return { ...episode, modelCode: episode.modelCode || String(stored.modelCode || ''), parameters: episode.parameters || parameters };
+  }) };
+  const index = templates.value.findIndex(template => template.id === item.id);
+  if (index >= 0) templates.value.splice(index, 1, item); else templates.value.unshift(item);
+  return item;
 }
 async function load() {
   loading.value = true; error.value = '';
@@ -516,8 +587,7 @@ async function save() {
     const result = isNewTemplate
       ? await request('/templates', { method: 'POST', body: JSON.stringify(payload) })
       : await request(`/templates/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) });
-    await load();
-    if (result?.template?.id) selectTemplateById(result.template.id);
+    if (result?.template?.id) { upsertLocalTemplate(result.template); selectTemplateById(result.template.id); }
     isCreating.value = false;
     notice.value = '模板已保存';
   } catch (e) { error.value = e instanceof Error ? e.message : '保存失败'; }
@@ -572,7 +642,7 @@ onMounted(() => { if (adminKey.value) void saveKey(); });
         <aside class="catalog">
           <div class="type-tabs" role="tablist"><button :class="{ active: activeType === 'SHORT_VIDEO' }" @click="selectType('SHORT_VIDEO')">视频</button><button :class="{ active: activeType === 'IMAGE_GENERATION' }" @click="selectType('IMAGE_GENERATION')">图片</button></div>
           <div class="catalog-header"><span>{{ activeType === 'SHORT_VIDEO' ? '视频' : '图片' }}模板</span><span class="count">{{ visibleTemplates.length }}</span></div>
-          <div class="excel-actions"><button type="button" class="secondary" @click="downloadExcelTemplate">下载 Excel 模板</button><button type="button" class="secondary" :disabled="importing" @click="importInput?.click()">{{ importing ? '正在导入…' : '导入 Excel' }}</button><input ref="importInput" type="file" accept=".xlsx,.xls" hidden @change="importExcel" /></div>
+          <div class="excel-actions"><button type="button" class="secondary" :disabled="loading || importing" @click="videoDirectoryInput?.click()">批量上传 / 更新视频目录</button><input ref="videoDirectoryInput" type="file" webkitdirectory multiple hidden @change="importVideoDirectory" /><button type="button" class="secondary" @click="downloadExcelTemplate">下载 Excel 模板</button><button type="button" class="secondary" :disabled="importing" @click="importInput?.click()">{{ importing ? '正在导入…' : '导入 Excel' }}</button><input ref="importInput" type="file" accept=".xlsx,.xls" hidden @change="importExcel" /></div>
           <div class="search-row"><span>⌕</span><input placeholder="搜索模板" /></div>
           <div v-if="visibleTemplates.length" class="catalog-bulk-actions">
             <div class="catalog-bulk-selection">
@@ -589,7 +659,7 @@ onMounted(() => { if (adminKey.value) void saveKey(); });
           <input v-model="checkedTemplateIds" type="checkbox" class="catalog-row-checkbox" :value="item.id" :aria-label="`选择模板 ${item.title}`" :disabled="loading" />
           <button type="button" class="template-row" :class="{ selected: selectedId === item.id }" @click="openTemplate(item)">
             <video v-if="catalogPreview(item)?.type === 'VIDEO'" :src="catalogImageUrl(item)" :poster="item.coverUrl" muted playsinline preload="none" aria-label="点击播放预览视频" @click.stop="openCatalogPreview(item)" />
-            <img v-else :src="catalogImageUrl(item)" alt="" loading="lazy" @click.stop="openCatalogPreview(item)" />
+            <img @error="handleImageError($event)" v-else :src="catalogImageUrl(item)" alt="" loading="lazy" @click.stop="openCatalogPreview(item)" />
             <span class="row-copy"><strong>{{ item.title }}</strong><small>{{ item.category || '未分类' }}<template v-if="item.type === 'COMIC_DRAMA' || item.type === 'MV'"> · {{ item.episodes.length }} 集</template></small></span>
             <span class="status-dot" :class="item.status.toLowerCase()" :title="item.status"></span>
           </button>
@@ -612,12 +682,12 @@ onMounted(() => { if (adminKey.value) void saveKey(); });
           <div class="tabbar"><button class="tab active">{{ draft.type === 'SHORT_VIDEO' ? '视频模板信息' : '图片模板信息' }}</button><span class="spacer"></span><span class="saved-label">{{ draft.status }}</span></div>
           <div class="editor-content">
             <section class="form-section"><div class="section-title"><div><h3>基本信息</h3><p>模板在客户端展示的名称、分类和封面</p></div></div>
-              <div class="form-grid"><label>模板名称<input v-model="draft.title" maxlength="200" placeholder="输入模板名称" /></label><label>唯一标识<input v-model="draft.slug" maxlength="160" placeholder="例如: neon-dream" /></label><label>类型<input :value="draft.type === 'SHORT_VIDEO' ? '视频' : '图片'" readonly /></label><label>分类<input v-model="draft.category" placeholder="例如：科幻 / 爱情" /></label><label class="span-2 asset-field">封面图<div class="asset-drop" @dragover.prevent @drop="handleDrop($event, (url) => draft!.coverUrl = url)" @click="chooseFile((url) => draft!.coverUrl = url)"><img v-if="draft.coverUrl" :src="draft.coverUrl" alt="封面预览" title="点击预览原图" @click.stop="openImagePreview(draft.coverUrl, draft.title + ' · 封面')" /><span v-else>拖拽图片到这里，或点击上传</span></div><button v-if="draft.coverUrl" type="button" class="secondary" @click.prevent="openImagePreview(draft.coverUrl, draft.title + ' · 封面')">查看原图</button><input :value="draft.coverUrl" readonly placeholder="上传完成后显示阿里云链接" /></label><label class="span-2">模板描述<textarea v-model="draft.description" rows="3" placeholder="用于模板目录展示的简介" /></label><label>状态<select v-model="draft.status"><option value="DRAFT">草稿</option><option value="PUBLISHED">已发布</option><option value="ARCHIVED">已归档</option></select></label><label>标签<input :value="draft.tags.join(', ')" placeholder="逗号分隔" @input="draft.tags = ($event.target as HTMLInputElement).value.split(',').map((tag) => tag.trim()).filter(Boolean)" /></label></div>
+              <div class="form-grid"><label>模板名称<input v-model="draft.title" maxlength="200" placeholder="输入模板名称" /></label><label>唯一标识<input v-model="draft.slug" maxlength="160" placeholder="例如: neon-dream" /></label><label>类型<input :value="draft.type === 'SHORT_VIDEO' ? '视频' : '图片'" readonly /></label><label>分类<input v-model="draft.category" placeholder="例如：科幻 / 爱情" /></label><label class="span-2 asset-field">封面图<div class="asset-drop" @dragover.prevent @drop="handleDrop($event, (url) => draft!.coverUrl = url)" @click="chooseFile((url) => draft!.coverUrl = url)"><img @error="handleImageError($event)" v-if="draft.coverUrl" :src="draft.coverUrl" alt="封面预览" title="点击预览原图" @click.stop="openImagePreview(draft.coverUrl, draft.title + ' · 封面')" /><span v-else>拖拽图片到这里，或点击上传</span></div><button v-if="draft.coverUrl" type="button" class="secondary" @click.prevent="openImagePreview(draft.coverUrl, draft.title + ' · 封面')">查看原图</button><input :value="draft.coverUrl" readonly placeholder="上传完成后显示阿里云链接" /></label><label class="span-2">模板描述<textarea v-model="draft.description" rows="3" placeholder="用于模板目录展示的简介" /></label><label>状态<select v-model="draft.status"><option value="DRAFT">草稿</option><option value="PUBLISHED">已发布</option><option value="ARCHIVED">已归档</option></select></label><label>标签<input :value="draft.tags.join(', ')" placeholder="逗号分隔" @input="draft.tags = ($event.target as HTMLInputElement).value.split(',').map((tag) => tag.trim()).filter(Boolean)" /></label></div>
               <div class="switch-row"><label><input v-model="draft.active" type="checkbox" /> 启用模板</label><label><input v-model="draft.premium" type="checkbox" /> 付费模板</label><label>排序权重 <input v-model.number="draft.sortOrder" type="number" class="short-input" /></label></div>
             </section>
             <section class="form-section episode-section"><div class="section-title"><div><h3>生成配置</h3><p>图片上传、画面比例和分辨率由客户端用户选择；其余必填参数由模板固定</p></div></div>
               <template v-if="currentEpisode">
-                <div class="form-grid"><label class="span-2 asset-field">预览视频或动图<div class="asset-drop" @dragover.prevent @drop="dropPreviewFile" @click="choosePreviewFile"><video v-if="currentPreview?.type === 'VIDEO'" :src="currentPreview.url" :poster="draft.coverUrl" controls playsinline preload="metadata" @click.stop /><img v-else-if="currentPreview" :src="currentPreview.url" alt="模板预览动图" title="点击预览原图或动图" @click.stop="openImagePreview(currentPreview.url, draft.title + ' · 预览')" /><span v-else>拖入视频、GIF 或 WebP，或点击上传</span></div><button v-if="currentPreview?.type === 'IMAGE'" type="button" class="secondary" @click.prevent="openImagePreview(currentPreview.url, draft.title + ' · 预览')">查看原图或动图</button><button v-if="currentPreview?.type === 'VIDEO'" type="button" class="secondary" @click.prevent="openMediaPreview(currentPreview.url, draft.title + ' · 预览视频', 'VIDEO', draft.coverUrl)">放大播放</button><input :value="currentPreview?.url || ''" readonly placeholder="上传后显示 OSS 地址" /><button v-if="currentPreview" type="button" class="secondary" :disabled="uploading" @click="choosePreviewFile">更换预览</button><button v-if="currentPreview" type="button" class="danger-quiet" @click="currentEpisode.mediaAssets = []">移除预览</button><small>用于客户端展示，与封面和生成参考素材分别保存。</small></label></div>
+                <div class="form-grid"><label class="span-2 asset-field">预览视频或动图<div class="asset-drop" @dragover.prevent @drop="dropPreviewFile" @click="choosePreviewFile"><video v-if="currentPreview?.type === 'VIDEO'" :src="currentPreview.url" :poster="draft.coverUrl" controls playsinline preload="metadata" @click.stop /><img @error="handleImageError($event)" v-else-if="currentPreview" :src="currentPreview.url" alt="模板预览动图" title="点击预览原图或动图" @click.stop="openImagePreview(currentPreview.url, draft.title + ' · 预览')" /><span v-else>拖入视频、GIF 或 WebP，或点击上传</span></div><button v-if="currentPreview?.type === 'IMAGE'" type="button" class="secondary" @click.prevent="openImagePreview(currentPreview.url, draft.title + ' · 预览')">查看原图或动图</button><button v-if="currentPreview?.type === 'VIDEO'" type="button" class="secondary" @click.prevent="openMediaPreview(currentPreview.url, draft.title + ' · 预览视频', 'VIDEO', draft.coverUrl)">放大播放</button><input :value="currentPreview?.url || ''" readonly placeholder="上传后显示 OSS 地址" /><button v-if="currentPreview" type="button" class="secondary" :disabled="uploading" @click="choosePreviewFile">更换预览</button><button v-if="currentPreview" type="button" class="danger-quiet" @click="currentEpisode.mediaAssets = []">移除预览</button><small>用于客户端展示，与封面和生成参考素材分别保存。</small></label></div>
                 <div class="form-grid episode-grid"><label>使用模型<select :value="currentEpisode.modelCode" @change="changeModel(($event.target as HTMLSelectElement).value)"><option disabled value="">选择数据库模型</option><option v-for="model in availableModels" :key="model.id" :value="model.code">{{ model.name }}</option></select></label><span></span><label class="span-2">生成提示词 <textarea v-model="currentEpisode.promptTemplate" rows="4" placeholder="输入客户端生成时使用的模板提示词"></textarea></label><label class="span-2">负向提示词<textarea v-model="currentEpisode.negativePrompt" rows="2" placeholder="不希望生成的内容"></textarea></label></div>
                 <div class="params-block"><div class="params-heading"><div><h4>模板控制的模型参数</h4><span>只展示当前模型除图片、画面比例、分辨率以外的参数</span></div><span class="param-count">{{ templateControlledParams.length }}</span></div><div v-for="param in templateControlledParams" :key="param.key" class="param-row"><div class="param-meta"><strong>{{ param.label }}</strong><em v-if="param.required">必填</em><code>{{ param.key }}</code><small v-if="param.description">{{ param.description }}</small></div><select v-if="param.type === 'SELECT'" v-model="currentEpisode.parameters[param.key]"><option disabled value="">请选择</option><option v-for="option in param.options" :key="option.value" :value="option.value">{{ option.label }}</option></select><select v-else-if="param.type === 'BOOLEAN'" v-model="currentEpisode.parameters[param.key]"><option :value="true">是</option><option :value="false">否</option></select><input v-else-if="param.type === 'NUMBER'" v-model.number="currentEpisode.parameters[param.key]" type="number" :min="param.min ?? undefined" :max="param.max ?? undefined" :placeholder="param.required ? '必填' : '可选'" /><input v-else v-model="currentEpisode.parameters[param.key]" :placeholder="param.required ? '必填' : '可选'" /></div><div v-if="!templateControlledParams.length" class="empty-params">当前模型没有需要由模板配置的参数。</div></div>
               </template>
@@ -632,7 +702,7 @@ onMounted(() => { if (adminKey.value) void saveKey(); });
       <div class="image-preview-header"><h2 id="image-preview-title">{{ imagePreviewTitle }}</h2><button type="button" class="secondary" autofocus @click="imagePreviewDialog?.close()">关闭</button></div>
       <p v-if="imagePreviewFailed" class="image-preview-error">素材加载失败，请检查素材地址、访问权限或浏览器支持的格式。</p>
       <video v-else-if="imagePreviewUrl && imagePreviewType === 'VIDEO'" :key="imagePreviewUrl" :src="imagePreviewUrl" :poster="imagePreviewPoster" :aria-label="imagePreviewTitle" controls autoplay playsinline preload="metadata" @error="imagePreviewFailed = true" />
-      <img v-else-if="imagePreviewUrl" :key="imagePreviewUrl" :src="imagePreviewUrl" :alt="imagePreviewTitle" @error="imagePreviewFailed = true" />
+      <img v-else-if="imagePreviewUrl" :key="imagePreviewUrl" :src="imagePreviewUrl" :alt="imagePreviewTitle" @error="handleImageError($event, true)" />
     </dialog>
     <footer><span>VILO STUDIO <i></i> CONTENT SYSTEM</span><label>API 管理密钥 <input v-model="adminKey" type="password" autocomplete="off" placeholder="输入管理密钥" @keyup.enter="saveKey" /><button type="button" class="secondary" :disabled="adminKeyStatus === 'checking'" @click="saveKey">{{ adminKeyStatus === 'checking' ? '验证中…' : '验证并保存' }}</button><small>{{ keyCacheError || (adminKey ? (adminKeyStatus === 'valid' ? '已缓存 · 已验证' : '已缓存到本浏览器') : '清空输入将清除缓存') }}</small></label><span>API {{ workspaceMode === 'templates' ? apiBase : remixApiBase }}</span></footer>
   </div>
